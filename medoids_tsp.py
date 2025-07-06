@@ -36,24 +36,43 @@ def get_distance_matrix(embeddings_a, embeddings_b=None):
     return distance_matrix
 
 
-def sort_tsp(embeddings, indices=None, cluster_assignment=None, dist_matrix_offset=None):
+def sort_tsp(embeddings,
+             indices:torch.IntTensor|None=None,
+             cluster_assignment=None,
+             dist_matrix_offset=None,
+             pin_first_index: int=None,
+             pin_last_index: int=None) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
     if indices is None:
         indices = torch.arange(embeddings.shape[0])
     print("computing distance matrix")
     medoids_distance_matrix = get_distance_matrix(embeddings[indices])
     if dist_matrix_offset is not None:
         medoids_distance_matrix += dist_matrix_offset
+
+    large_distance = medoids_distance_matrix.max() * 10
+    #if preserve_ends:
+    #    medoids_distance_matrix[0, -1] = large_distance
+    #    medoids_distance_matrix[-1, 0] = large_distance
+    if pin_first_index is not None:
+        medoids_distance_matrix[:, pin_first_index] = large_distance
+    if pin_last_index is not None:
+        medoids_distance_matrix[pin_last_index, :] = large_distance
+    medoids_distance_matrix.fill_diagonal_(0)
+
     # route = solve_mtsp_dynamic_programming(medoids_distance_matrix, 1)
     # route = solve_tsp_simulated_annealing(medoids_distance_matrix)
     print("computing route")
     #print(medoids_distance_matrix)
     route = solve_tsp_fasttsp(medoids_distance_matrix)
-    # solve_tsp_nearest_neighbor(medoids_distance_matrix)
+
     indices_sorted = indices[route]
     if cluster_assignment is None:
         return indices_sorted
+    else:
+        return indices_sorted, apply_route_to_cluster_assignment(route, cluster_assignment)
 
-    inv_route = torch.unique(torch.tensor(route), return_inverse=True)[1]
+
+def apply_route_to_cluster_assignment(route, cluster_assignment) -> torch.Tensor:
     inv_route = {}
     for pos, idx in enumerate(route):
         inv_route[idx] = pos
@@ -64,4 +83,4 @@ def sort_tsp(embeddings, indices=None, cluster_assignment=None, dist_matrix_offs
     ]
     cluster_assignment_sorted = torch.tensor(cluster_assignment_sorted)
 
-    return indices_sorted, cluster_assignment_sorted
+    return cluster_assignment_sorted
