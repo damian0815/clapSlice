@@ -7,11 +7,12 @@ def add_frames_to_output(output_frames: torch.Tensor|None, frames: torch.Tensor,
     if output_frames is None:
         output_frames = torch.zeros_like(frames)
     while output_frames.shape[1] < frames.shape[1]:
-        print('duplicating last frame of output buffer to match input length')
-        output_frames = torch.cat([output_frames, output_frames[:, -1]], dim=1)
+        #print('duplicating last frame of output buffer to match input length')
+        #last_frame = output_frames.shape[:, -1:, :, :]
+        output_frames = torch.cat([output_frames, output_frames[:, -1:]], dim=1)
     while frames.shape[1] < output_frames.shape[1]:
-        print('duplicating last frame of input to match output buffer length')
-        frames = torch.cat([frames, frames[:, -1]], dim=1)
+        #print('duplicating last frame of input to match output buffer length')
+        frames = torch.cat([frames, frames[:, -1:]], dim=1)
 
     output_frames += frames * amplitude
     return output_frames
@@ -45,3 +46,7 @@ class VideoWriter:
             frame.pts = None
             self.video_output.mux(self.stream.encode(frame))
             del frame_data, frame
+
+    def close(self):
+        self.video_output.close()
+        del self.video_output

@@ -22,7 +22,7 @@ class VideoChunkCache:
 
     def get_chunk(self, index: int) -> torch.Tensor:
         existing = self._find_chunk(index)
-        if existing:
+        if existing is not None:
             return existing
 
         return self._load_chunk(index)
@@ -38,9 +38,9 @@ class VideoChunkCache:
         video_frames = video_data['video']
         del video_data
         self.chunks.append(CacheItem(chunk_index=index, frames=video_frames))
-        print(f'loaded chunk {index}')
+        #print(f'loaded chunk {index}')
         if len(self.chunks) > self.max_cache_size:
-            print("evicting chunk", self.chunks[0].chunk_index)
+            #print("evicting chunk", self.chunks[0].chunk_index)
             del self.chunks[0]
         return video_frames
 
@@ -49,10 +49,11 @@ class VideoChunkCache:
                       if i == index), (None, None))
         if cache_index is None:
             return None
+        chunk: CacheItem
         # move to the top
-        cache_item = self.chunks.pop(cache_index)
-        self.chunks.append(cache_item)
-        return chunk
+        self.chunks.pop(cache_index)
+        self.chunks.append(chunk)
+        return chunk.frames
 
 
 
