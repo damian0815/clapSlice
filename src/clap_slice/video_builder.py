@@ -2,6 +2,12 @@ import torch
 import av
 from tqdm.auto import tqdm
 
+from src.clap_slice.chunk_smearer import SmearDetails
+from src.clap_slice.video_chunk_cache import VideoChunkCache
+
+
+
+
 
 def add_frames_to_output(output_frames: torch.Tensor|None, frames: torch.Tensor, amplitude: float) -> torch.Tensor:
     if output_frames is None:
@@ -45,3 +51,21 @@ class VideoWriter:
             frame.pts = None
             self.video_output.mux(self.stream.encode(frame))
             del frame_data, frame
+
+
+def apply_audio_smear_to_video(video_chunk_cache: VideoChunkCache, video_writer: VideoWriter,
+                               smear_details: list[SmearDetails]):
+    previous_source_indices = set()
+    for chunk_sources in tqdm(smear_details):
+        this_source_indices = {sd.source_chunk_index for sd in chunk_sources}
+        handle_first = previous_source_indices.intersection(this_source_indices)
+        handle_next = this_source_indices.difference(previous_source_indices)
+        # todo: priority
+        output_frames = None
+        for source_index in tqdm(list(sorted(handle_first) + sorted(handle_next)), leave=False):
+            smear_details = next(sd for sd in chunk_sources
+                                 if sd.source_chunk_index == source_index)
+            chunk = video_chunk_cache.get_chunk(source_index)
+            output_frames = add_frames_to_output(output_frames, chunk, smear_details.amplitude)
+
+        video_writer.append_frames(output_frames)
