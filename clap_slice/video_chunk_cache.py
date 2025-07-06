@@ -22,7 +22,7 @@ class VideoChunkCache:
 
     def get_chunk(self, index: int) -> torch.Tensor:
         existing = self._find_chunk(index)
-        if existing:
+        if existing is not None:
             return existing
 
         return self._load_chunk(index)
@@ -45,14 +45,15 @@ class VideoChunkCache:
         return video_frames
 
     def _find_chunk(self, index: int) -> torch.Tensor|None:
-        cache_index, chunk = next(((i, chunk) for i, chunk in enumerate(self.chunks)
-                      if i == index), (None, None))
-        if cache_index is None:
+        cache_slot, chunk = next(((cache_slot, chunk) for cache_slot, chunk in enumerate(self.chunks)
+                      if chunk.chunk_index == index), (None, None))
+        if cache_slot is None:
             return None
+        chunk: CacheItem
         # move to the top
-        cache_item = self.chunks.pop(cache_index)
-        self.chunks.append(cache_item)
-        return chunk
+        self.chunks.pop(cache_slot)
+        self.chunks.append(chunk)
+        return chunk.frames
 
 
 

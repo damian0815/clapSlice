@@ -5,8 +5,8 @@ from typing import Generator, Literal
 
 from torio.io import CodecConfig
 
-from chunk_smearer import get_smear_source_list, SmearDetails
-from medoids_tsp import sort_tsp
+from clap_slice.chunk_smearer import get_smear_source_list, SmearDetails
+from clap_slice.medoids_tsp import sort_tsp
 
 import torch
 import torchaudio
@@ -56,7 +56,7 @@ class AudioOrdering:
 
 
 @dataclass
-class ApplyAudioOrderingResult:
+class AudioOrderingResult:
     output_audio: torch.Tensor
     smear_details: list[SmearDetails]
 
@@ -123,7 +123,7 @@ class AudioOrderer:
                     smear_modifiers: list[SmearModifier] = None,
                     smooth_smear_modifiers: bool = True,
                     save: bool = False
-        ) -> ApplyAudioOrderingResult:
+        ) -> AudioOrderingResult:
 
         order = audio_ordering.sort_order
         source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=self.get_chunk_size_seconds(audio_ordering.chunk_beats))
@@ -163,7 +163,8 @@ class AudioOrderer:
                         torch.ones(chunk_size_samples - noclip_ramp),
                         torch.linspace(1, 1, noclip_ramp)
                     ])
-                smeared_chunk += source_chunks[source.source_chunk_index] * source.amplitude * zero_crosser
+                amplitude = source.envelope_amplitude / len(sources)
+                smeared_chunk += source_chunks[source.source_chunk_index] * amplitude * zero_crosser
             smeared_chunks.append(smeared_chunk)
 
         smeared_result = torch.cat(smeared_chunks, dim=1)
@@ -175,7 +176,7 @@ class AudioOrderer:
                 save_path, smeared_result, sample_rate=self.sampling_rate, compression=CodecConfig(qscale=0))
             print('saved to', save_path)
 
-        return ApplyAudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
+        return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
 
 
     def get_audio_chunks_mono(self, chunk_size_seconds: float, window_width_chunks: float=0, waveform: torch.Tensor=None):

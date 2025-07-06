@@ -9,12 +9,12 @@ import torch
 @dataclass
 class SmearDetails:
     source_chunk_index: int
-    amplitude: float
+    envelope_amplitude: float
     priority: float
     ramp_type: Literal['ramp_in', 'ramp_in_out', 'ramp_out', 'none']
 
     def __repr__(self):
-        return f"Smear({self.source_chunk_index} * {self.amplitude}{', '+self.ramp_type if self.ramp_type != 'none' else ''}))"
+        return f"Smear({self.source_chunk_index} * {self.envelope_amplitude}{', '+self.ramp_type if self.ramp_type != 'none' else ''}))"
 
 
 def get_smear_source_list(
@@ -61,9 +61,6 @@ def get_smear_source_list(
             spread = round(spread)
             envelope = _build_envelope(envelope_shape, smear_width, smear_mode)
 
-        #common_chunk_amplitude_factor = 1 / ((spread + 1) * (smear_width + 1))
-        common_chunk_amplitude_factor = 1
-
         for smear_slot in range(-smear_width, smear_width + 1):
             for spread_slot in range(-spread, spread + 1):
                 priority = -abs(smear_slot) + -abs(spread_slot/2)
@@ -84,7 +81,7 @@ def get_smear_source_list(
 
                 smear_details = SmearDetails(
                     source_chunk_index=this_source_chunk_idx,
-                    amplitude=envelope[smear_slot + smear_width] * common_chunk_amplitude_factor,
+                    envelope_amplitude=envelope[smear_slot + smear_width],
                     priority=priority,
                     ramp_type=ramp_type
                 )
@@ -99,12 +96,6 @@ def get_smear_source_list(
                 smear_source_dict[target_index].append(smear_details)
         #break
     smear_source_list = [v for k, v in sorted(smear_source_dict.items(), key=lambda kv: kv[0])]
-    for smears in smear_source_list:
-        #total_amplitude = sum(sm.amplitude for sm in smears)
-        total_amplitude = len(smears)
-        for sm in smears:
-            sm.amplitude /= total_amplitude
-
     if not consolidate_smears:
         return smear_source_list
     else:
@@ -127,16 +118,21 @@ def _build_envelope(envelope_shape, smear_width: float, smear_mode) -> torch.Ten
             envelope[i] = 0
     return envelope
 
+
 def _consolidate_smears(smears: list[SmearDetails]) -> list[SmearDetails]:
-    unique_sources = sorted({(sd.source_chunk_index, sd.ramp_type) for sd in smears})
+    unique_sources = sorted({sd.source_chunk_index for sd in smears})
     consolidated_smears = []
-    for source_index, ramp_type in unique_sources:
+    for source_index in unique_sources:
         smears_to_consolidate = [sd for sd in smears
-                                 if sd.source_chunk_index == source_index and sd.ramp_type == ramp_type]
-        amplitude = sum(sd.amplitude for sd in smears_to_consolidate)
+                                 if sd.source_chunk_index == source_index]
+        envelope_amplitude = max(sd.envelope_amplitude for sd in smears_to_consolidate)
         priority = max(sd.priority for sd in smears_to_consolidate)
+        ramp_type = max(smears_to_consolidate, key=lambda sd: sd.envelope_amplitude).ramp_type
         consolidated_smears.append(SmearDetails(
-            source_chunk_index=source_index, amplitude=amplitude, priority=priority, ramp_type=ramp_type
+            source_chunk_index=source_index,
+            envelope_amplitude=envelope_amplitude,
+            priority=priority,
+            ramp_type=ramp_type
         ))
     return consolidated_smears
 

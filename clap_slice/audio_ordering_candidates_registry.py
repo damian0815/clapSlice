@@ -1,7 +1,7 @@
 import os
 import pickle
 
-from audio_orderer import AudioOrdering
+from clap_slice.audio_orderer import AudioOrdering
 
 
 def save_candidate(audio_ordering: AudioOrdering, registry_root='./audio_ordering_candidates_registry'):
