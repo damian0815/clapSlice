@@ -1,0 +1,8 @@
+transformers
+librosa
+soundfile
+numpy<2
+torch
+torchaudio
+fast-tsp
+kmedoids

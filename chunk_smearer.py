@@ -61,7 +61,8 @@ def get_smear_source_list(
             spread = round(spread)
             envelope = _build_envelope(envelope_shape, smear_width, smear_mode)
 
-        common_chunk_amplitude_factor = 1 / ((spread + 1) * (smear_width + 1))
+        #common_chunk_amplitude_factor = 1 / ((spread + 1) * (smear_width + 1))
+        common_chunk_amplitude_factor = 1
 
         for smear_slot in range(-smear_width, smear_width + 1):
             for spread_slot in range(-spread, spread + 1):
@@ -69,11 +70,8 @@ def get_smear_source_list(
                 this_source_chunk_idx = source_chunk_idx + spread_slot
                 if wrap_mode == 'wrap':
                     this_source_chunk_idx = this_source_chunk_idx % num_source_chunks
-                elif wrap_mode == 'cut':
-                    if this_source_chunk_idx < 0 or this_source_chunk_idx >= num_source_chunks:
+                elif this_source_chunk_idx < 0 or this_source_chunk_idx >= num_source_chunks:
                         continue
-                elif wrap_mode != 'bleed':
-                    raise ValueError(f'Unknown wrap_mode {wrap_mode}')
 
                 if spread == 0:
                     ramp_type = 'ramp_in_out'
@@ -101,6 +99,12 @@ def get_smear_source_list(
                 smear_source_dict[target_index].append(smear_details)
         #break
     smear_source_list = [v for k, v in sorted(smear_source_dict.items(), key=lambda kv: kv[0])]
+    for smears in smear_source_list:
+        #total_amplitude = sum(sm.amplitude for sm in smears)
+        total_amplitude = len(smears)
+        for sm in smears:
+            sm.amplitude /= total_amplitude
+
     if not consolidate_smears:
         return smear_source_list
     else:

@@ -3,7 +3,9 @@ import pickle
 from dataclasses import dataclass
 from typing import Generator, Literal
 
-from chunk_smearer import get_smear_source_list
+from torio.io import CodecConfig
+
+from chunk_smearer import get_smear_source_list, SmearDetails
 from medoids_tsp import sort_tsp
 
 import torch
@@ -51,6 +53,12 @@ class AudioOrdering:
     chunk_beats: float
     sort_order: list[int]
     window_width: float
+
+
+@dataclass
+class ApplyAudioOrderingResult:
+    output_audio: torch.Tensor
+    smear_details: list[SmearDetails]
 
 
 class AudioOrderer:
@@ -114,7 +122,8 @@ class AudioOrderer:
                     envelope_shape: Literal['cos_2pi', 'sin_pi', 'log']='log',
                     smear_modifiers: list[SmearModifier] = None,
                     smooth_smear_modifiers: bool = True,
-                    save: bool = False) -> torch.Tensor:
+                    save: bool = False
+        ) -> ApplyAudioOrderingResult:
 
         order = audio_ordering.sort_order
         source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=self.get_chunk_size_seconds(audio_ordering.chunk_beats))
@@ -141,8 +150,8 @@ class AudioOrderer:
             smeared_chunk = torch.zeros_like(source_chunks[0])
             for source in sources:
 
-                noclip_ramp = 200
                 chunk_size_samples = smeared_chunk.shape[1]
+                noclip_ramp = min(1000, chunk_size_samples)
                 zero_crosser = torch.ones_like(source_chunks[0])
                 if source.ramp_type == 'ramp_in' or source.ramp_type == 'ramp_in_out':
                     zero_crosser *= torch.cat([
@@ -160,12 +169,14 @@ class AudioOrderer:
         smeared_result = torch.cat(smeared_chunks, dim=1)
 
         if save:
-            save_path = self.source_audio_path + f'-sorted-bpm{self.bpm}-cb{audio_ordering.chunk_beats}-ww{audio_ordering.window_width}-smeared-sw{smear_width}-spread{spread}-dyn2.wav'
+            smear_type_str = f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}'
+            save_path = self.source_audio_path + f'-sorted-bpm{self.bpm}-cb{audio_ordering.chunk_beats}-ww{audio_ordering.window_width}-smeared-{smear_type_str}.wav.mp3'
             torchaudio.save(
-                save_path, smeared_result, sample_rate=self.sampling_rate)
+                save_path, smeared_result, sample_rate=self.sampling_rate, compression=CodecConfig(qscale=0))
             print('saved to', save_path)
 
-        return smeared_result
+        return ApplyAudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
+
 
     def get_audio_chunks_mono(self, chunk_size_seconds: float, window_width_chunks: float=0, waveform: torch.Tensor=None):
         waveform = waveform or self.waveform
