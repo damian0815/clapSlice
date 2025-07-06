@@ -163,11 +163,13 @@ class AudioOrderer:
                         torch.ones(chunk_size_samples - noclip_ramp),
                         torch.linspace(1, 1, noclip_ramp)
                     ])
-                amplitude = source.envelope_amplitude / len(sources)
+                #amplitude = source.source_amplitude / len(sources)
+                amplitude = source.source_amplitude
                 smeared_chunk += source_chunks[source.source_chunk_index] * amplitude * zero_crosser
             smeared_chunks.append(smeared_chunk)
 
         smeared_result = torch.cat(smeared_chunks, dim=1)
+        smeared_result = 0.99 * smeared_result / smeared_result.abs().max()
 
         if save:
             smear_type_str = f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}'

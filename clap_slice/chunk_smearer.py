@@ -9,12 +9,13 @@ import torch
 @dataclass
 class SmearDetails:
     source_chunk_index: int
-    envelope_amplitude: float
+    source_amplitude: float
+    spread_slot_pct: float
     priority: float
     ramp_type: Literal['ramp_in', 'ramp_in_out', 'ramp_out', 'none']
 
     def __repr__(self):
-        return f"Smear({self.source_chunk_index} * {self.envelope_amplitude}{', '+self.ramp_type if self.ramp_type != 'none' else ''}))"
+        return f"Smear({self.source_chunk_index}({self.spread_slot_pct} * {self.source_amplitude}{', ' + self.ramp_type if self.ramp_type != 'none' else ''}))"
 
 
 def get_smear_source_list(
@@ -81,7 +82,8 @@ def get_smear_source_list(
 
                 smear_details = SmearDetails(
                     source_chunk_index=this_source_chunk_idx,
-                    envelope_amplitude=envelope[smear_slot + smear_width],
+                    source_amplitude=envelope[smear_slot + smear_width],
+                    spread_slot_pct=(spread_slot / spread if spread > 0 else 0),
                     priority=priority,
                     ramp_type=ramp_type
                 )
@@ -125,12 +127,14 @@ def _consolidate_smears(smears: list[SmearDetails]) -> list[SmearDetails]:
     for source_index in unique_sources:
         smears_to_consolidate = [sd for sd in smears
                                  if sd.source_chunk_index == source_index]
-        envelope_amplitude = max(sd.envelope_amplitude for sd in smears_to_consolidate)
+        envelope_amplitude = sum(sd.source_amplitude for sd in smears_to_consolidate)
         priority = max(sd.priority for sd in smears_to_consolidate)
-        ramp_type = max(smears_to_consolidate, key=lambda sd: sd.envelope_amplitude).ramp_type
+        ramp_type = max(smears_to_consolidate, key=lambda sd: sd.soeurce_amplitude).ramp_type
+        spread_slot_pct = min(sd.spread_slot_pct for sd in smears_to_consolidate)
         consolidated_smears.append(SmearDetails(
             source_chunk_index=source_index,
-            envelope_amplitude=envelope_amplitude,
+            source_amplitude=envelope_amplitude,
+            spread_slot_pct=spread_slot_pct,
             priority=priority,
             ramp_type=ramp_type
         ))
