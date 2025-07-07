@@ -85,7 +85,7 @@ class AudioOrderer:
 
 
     def get_audio_features(self, chunk_beats: float, ignore_cache: bool=False, window_width_chunks: float=0, waveform: torch.Tensor=None):
-        features_pickle_filename = self.source_audio_path + f'.clap-norm-bpm{self.bpm}-cb{chunk_beats}-ww{window_width_chunks}.pkl'
+        features_pickle_filename = self.source_audio_path + f'.clap-norm-bpm{self.bpm}-cb{chunk_beats}-ww{window_width_chunks}-offset{self.first_beat_offset_seconds}.pkl'
         if os.path.exists(features_pickle_filename) and not ignore_cache:
             with open(features_pickle_filename, 'rb') as f:
                 return pickle.load(f)
