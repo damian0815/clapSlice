@@ -91,12 +91,15 @@ def apply_audio_smear_to_video(video_chunk_cache: VideoChunkCache,
     previous_source_indices = set()
     chunk_size_seconds = video_chunk_cache.chunk_size_seconds
 
+    max_amplitude = max([max(smears, key=lambda x: x.source_amplitude).source_amplitude
+                         for smears in smear_details])
     if blend_mode == 'add':
-        max_amplitude = max([max(smears, key=lambda x: x.source_amplitude).source_amplitude
-                             for smears in smear_details])
         normalization_scaling = 1/max_amplitude
+    elif blend_mode == 'max':
+        normalization_scaling = 1/math.sqrt(max_amplitude)
     else:
         normalization_scaling = 1
+    print('normalization_scaling:', normalization_scaling)
 
     for out_chunk_index, chunk_sources in enumerate(tqdm(smear_details)):
 
@@ -106,16 +109,15 @@ def apply_audio_smear_to_video(video_chunk_cache: VideoChunkCache,
         next_chunk_first_frame_index = math.ceil(next_chunk_start_time * video_writer.fps)
         chunk_length_frames = next_chunk_first_frame_index - chunk_first_frame_index
 
-        this_source_indices = {sd.source_chunk_index for sd in chunk_sources}
-        handle_first = previous_source_indices.intersection(this_source_indices)
-        handle_next = this_source_indices.difference(previous_source_indices)
-        # todo: priority
+        smear_details_highest_priority_last = sorted(
+            chunk_sources,
+            key=lambda x: x.spread_slot_pct,
+            reverse=True
+        )
+
         output_frames = None
-        print([smear_details.source_amplitude for smear_details in chunk_sources])
-        for source_index in list(sorted(handle_first) + sorted(handle_next)):
-            smear_details = next(sd for sd in chunk_sources
-                                 if sd.source_chunk_index == source_index)
-            chunk = video_chunk_cache.get_chunk(source_index).float() / 255
+        for smear_details in smear_details_highest_priority_last:
+            chunk = video_chunk_cache.get_chunk(smear_details.source_chunk_index).float() / 255
             #amplitude = math.sqrt(smear_details.source_amplitude)
             amplitude = (smear_details.source_amplitude * math.sqrt(1-smear_details.spread_slot_pct))
             #if blend_mode == 'max':

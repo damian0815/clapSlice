@@ -10,13 +10,14 @@ class CacheItem:
 
 class VideoChunkCache:
 
-    chunks: list[CacheItem] = []  # chunk_index, data
+    chunks: list[CacheItem]  # chunk_index, data
     video: EncodedVideoPyAV
     chunk_size_seconds: float
     max_cache_size: int
 
     def __init__(self, video: EncodedVideoPyAV, chunk_size_seconds: float, max_cache_size: int=5):
         self.video = video
+        self.chunks = []
         self.chunk_size_seconds = chunk_size_seconds
         self.max_cache_size = max_cache_size
 

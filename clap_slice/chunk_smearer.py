@@ -129,7 +129,7 @@ def _consolidate_smears(smears: list[SmearDetails]) -> list[SmearDetails]:
                                  if sd.source_chunk_index == source_index]
         envelope_amplitude = sum(sd.source_amplitude for sd in smears_to_consolidate)
         priority = max(sd.priority for sd in smears_to_consolidate)
-        ramp_type = max(smears_to_consolidate, key=lambda sd: sd.soeurce_amplitude).ramp_type
+        ramp_type = max(smears_to_consolidate, key=lambda sd: sd.source_amplitude).ramp_type
         spread_slot_pct = min(sd.spread_slot_pct for sd in smears_to_consolidate)
         consolidated_smears.append(SmearDetails(
             source_chunk_index=source_index,

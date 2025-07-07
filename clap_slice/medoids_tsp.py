@@ -41,10 +41,10 @@ def sort_tsp(embeddings,
              cluster_assignment=None,
              dist_matrix_offset=None,
              pin_first_index: int=None,
-             pin_last_index: int=None) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
+             pin_last_index: int=None,
+             ) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
     if indices is None:
         indices = torch.arange(embeddings.shape[0])
-    print("computing distance matrix")
     medoids_distance_matrix = get_distance_matrix(embeddings[indices])
     if dist_matrix_offset is not None:
         medoids_distance_matrix += dist_matrix_offset
@@ -53,10 +53,12 @@ def sort_tsp(embeddings,
     #if preserve_ends:
     #    medoids_distance_matrix[0, -1] = large_distance
     #    medoids_distance_matrix[-1, 0] = large_distance
+    #print("pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
     if pin_first_index is not None:
         medoids_distance_matrix[:, pin_first_index] = large_distance
     if pin_last_index is not None:
         medoids_distance_matrix[pin_last_index, :] = large_distance
+    #print("after pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
     medoids_distance_matrix.fill_diagonal_(0)
 
     # route = solve_mtsp_dynamic_programming(medoids_distance_matrix, 1)

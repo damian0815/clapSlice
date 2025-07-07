@@ -151,7 +151,7 @@ class AudioOrderer:
             for source in sources:
 
                 chunk_size_samples = smeared_chunk.shape[1]
-                noclip_ramp = min(1000, chunk_size_samples)
+                noclip_ramp = min(100, chunk_size_samples)
                 zero_crosser = torch.ones_like(source_chunks[0])
                 if source.ramp_type == 'ramp_in' or source.ramp_type == 'ramp_in_out':
                     zero_crosser *= torch.cat([
@@ -276,8 +276,8 @@ class DynamicSmearer:
                 * self.spreads.to(device)
             ).item()
             print('smear width:', smear_width, ' spread:', spread, end='')
-            smear_width = max(round(smear_width), 1)
-            spread = max(round(spread), 1)
+            smear_width = max(round(smear_width), 0)
+            spread = max(round(spread), 0)
             print(' ->', smear_width, spread)
         else:
             smear_width = self.smear_widths[int(logits_norm.argmax().item())].item()
