@@ -17,6 +17,13 @@ def save_candidate(audio_ordering: AudioOrdering, registry_root='./audio_orderin
     return path
 
 
+def load_candidate(source_audio_path: str, candidate_index: int, registry_root='./audio_ordering_candidates_registry') -> AudioOrdering:
+    source_subfolder = make_source_subfolder(registry_root=registry_root, source_audio_path=source_audio_path)
+    path = make_candidate_path(source_subfolder, candidate_index)
+    with open(path, 'rb') as f:
+        return pickle.load(f)
+
+
 def already_saved(audio_ordering: AudioOrdering, registry_root: str) -> bool:
     source_subfolder = make_source_subfolder(registry_root, source_audio_path=audio_ordering.source_audio)
     final_index = get_next_candidate_index(source_subfolder)
