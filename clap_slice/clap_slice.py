@@ -12,15 +12,16 @@ class ClapSlice:
         self.registry_root = registry_root
 
     def run_audio_ordering(
-            self,
-            input_filename,
-            bpm: float,
-            chunk_size_beats: float,
-            smear_width: int=2,
-            spread: int=0,
-            smear_modifiers: list[SmearModifier]=None
+        self,
+        input_filename,
+        bpm: float,
+        chunk_size_beats: float,
+        smear_width: int=2,
+        spread: int=0,
+        smear_modifiers: list[SmearModifier]=None,
+        first_beat_offset_seconds: float = 0,
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
-        audio_orderer = AudioOrderer(clap=self.clap, source_audio_path=input_filename, bpm=bpm)
+        audio_orderer = AudioOrderer(clap=self.clap, source_audio_path=input_filename, bpm=bpm, first_beat_offset_seconds=first_beat_offset_seconds)
         sort_order = audio_orderer.make_order(chunk_beats=chunk_size_beats, preserve_start_and_end=True)
         audio_ordering_result = audio_orderer.apply_order(
             audio_ordering=sort_order,
