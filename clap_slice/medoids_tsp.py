@@ -55,9 +55,9 @@ def sort_tsp(embeddings,
     #    medoids_distance_matrix[-1, 0] = large_distance
     #print("pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
     if pin_first_index is not None:
-        medoids_distance_matrix[:, pin_first_index] = large_distance
+        medoids_distance_matrix[:, pin_first_index] += large_distance
     if pin_last_index is not None:
-        medoids_distance_matrix[pin_last_index, :] = large_distance
+        medoids_distance_matrix[pin_last_index, :] += large_distance
     #print("after pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
     medoids_distance_matrix.fill_diagonal_(0)
 

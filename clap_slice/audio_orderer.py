@@ -129,7 +129,7 @@ class AudioOrderer:
         ) -> AudioOrderingResult:
 
         order = audio_ordering.sort_order
-        source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=self.get_chunk_size_seconds(audio_ordering.chunk_beats), wrap_mode=wrap_mode)
+        source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=self.get_chunk_size_seconds(audio_ordering.chunk_beats))
         source_embeddings = self.get_audio_features(audio_ordering.chunk_beats)
 
         if smear_modifiers is None:
@@ -213,7 +213,7 @@ class AudioOrderer:
         return mono_chunks
 
 
-    def get_audio_chunks_stereo(self, chunk_size_seconds: float, window_width_chunks: float=0, waveform: torch.Tensor=None, wrap_mode: Literal['wrap', 'cut', 'bleed']='wrap'):
+    def get_audio_chunks_stereo(self, chunk_size_seconds: float, window_width_chunks: float=0, waveform: torch.Tensor=None):
         waveform = waveform or self.waveform
         left_chunks_no_window = list(
             get_audio_chunks(
@@ -222,7 +222,6 @@ class AudioOrderer:
                 chunk_size_seconds=chunk_size_seconds,
                 window_width_chunks=window_width_chunks,
                 first_beat_offset_seconds=self.first_beat_offset_seconds,
-                wrap_mode=wrap_mode
             )
         )[:-1]
         right_chunks_no_window = list(
@@ -232,7 +231,6 @@ class AudioOrderer:
                 chunk_size_seconds=chunk_size_seconds,
                 window_width_chunks=window_width_chunks,
                 first_beat_offset_seconds = self.first_beat_offset_seconds,
-                wrap_mode=wrap_mode
             )
         )[:-1]
         stereo_chunks = [torch.stack([left_chunks_no_window[index], right_chunks_no_window[index]])
@@ -244,18 +242,21 @@ class AudioOrderer:
 def get_audio_chunks(waveform, sampling_rate, chunk_size_seconds: float,
                      window_width_chunks: float = 0,
                      first_beat_offset_seconds: float = 0,
-                     wrap_mode: Literal['wrap', 'cut', 'bleed']='wrap'
                      ) -> Generator[torch.Tensor, None, None]:
     if len(waveform.shape) != 1:
         raise ValueError("waveform should have shape [num_samples]")
     chunk_size_samples = int(8 * ((sampling_rate * chunk_size_seconds) // 8))
     first_beat_offset_samples = round(sampling_rate * first_beat_offset_seconds)
+
+    wrap_mode: Literal['cut', 'bleed', 'wrap'] = 'bleed'
+
     if wrap_mode == 'cut':
         waveform = waveform[first_beat_offset_samples:]
     elif wrap_mode == 'bleed' or wrap_mode == 'wrap':
         while first_beat_offset_samples > 0:
             first_beat_offset_samples -= chunk_size_samples
         if first_beat_offset_samples < 0:
+            padding = None
             if wrap_mode == 'bleed':
                 padding = torch.zeros(-first_beat_offset_samples).to(waveform.device)
             elif wrap_mode == 'wrap':
