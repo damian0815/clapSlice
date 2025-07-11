@@ -1,9 +1,12 @@
-from clap_slice import AudioOrderer, CLAPWrapper
-import torch
+from pytorchvideo.data.encoded_video import EncodedVideo
+from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
+
+from clap_slice import AudioOrderer, CLAPWrapper, VideoChunkCache, SmearDetails
+import av
 
 from clap_slice.audio_orderer import AudioOrdering, AudioOrderingResult
-
-from clap_slice import SmearModifier
+from clap_slice.video_builder import add_frames_to_output, VideoWriter, apply_audio_smear_to_video
+from clap_slice import SmearModifier, get_smear_source_list
 
 class ClapSlice:
 
@@ -33,3 +36,33 @@ class ClapSlice:
             smooth_smear_modifiers=True
         )
         return sort_order, audio_ordering_result
+
+
+    def apply_audio_order_to_video(self,
+                                   video_input_path: str,
+                                   smear_details: list[list[SmearDetails]],
+                                   chunk_size_seconds: float,
+                                   video_output_path: str):
+        try:
+            video: EncodedVideoPyAV = EncodedVideo.from_path(video_input_path, decode_audio=False)
+            fps = video._container.streams.video[0].guessed_rate
+
+            print('fps:', fps)
+
+            video_chunk_cache = VideoChunkCache(video=video,
+                                                chunk_size_seconds=chunk_size_seconds,
+                                                max_cache_size=30)
+            first_chunk = video_chunk_cache.get_chunk(0)
+            # shape = torch.Size([3, <N>, 480, 640])
+            width = first_chunk.shape[3]
+            height = first_chunk.shape[2]
+
+            blend_mode = 'max'
+            video_writer = VideoWriter(output_path=video_output_path, fps=fps, width=width, height=height)
+            apply_audio_smear_to_video(video_chunk_cache,
+                                       video_writer,
+                                       smear_details=smear_details,
+                                       blend_mode=blend_mode,
+                                       max_chunks_to_write=None)
+        finally:
+            video_writer.close()

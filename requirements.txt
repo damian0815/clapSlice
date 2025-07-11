@@ -5,4 +5,5 @@ numpy<2
 torch
 torchaudio
 fast-tsp
+tsp_solver2
 kmedoids

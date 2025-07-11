@@ -46,8 +46,14 @@ class VideoChunkCache:
         return video_frames
 
     def _find_chunk(self, index: int) -> torch.Tensor|None:
-        cache_slot, chunk = next(((cache_slot, chunk) for cache_slot, chunk in enumerate(self.chunks)
-                      if chunk.chunk_index == index), (None, None))
+        cache_slot, chunk = next(
+            (
+                (cache_slot, chunk)
+                for cache_slot, chunk in enumerate(self.chunks)
+                if chunk.chunk_index == index
+            ),
+            (None, None))
+
         if cache_slot is None:
             return None
         chunk: CacheItem

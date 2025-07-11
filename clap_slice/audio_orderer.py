@@ -60,6 +60,7 @@ class AudioOrdering:
 class AudioOrderingResult:
     output_audio: torch.Tensor
     smear_details: list[SmearDetails]
+    chunk_size_seconds: float
 
 
 class AudioOrderer:
@@ -129,7 +130,8 @@ class AudioOrderer:
         ) -> AudioOrderingResult:
 
         order = audio_ordering.sort_order
-        source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=self.get_chunk_size_seconds(audio_ordering.chunk_beats))
+        chunk_size_seconds = self.get_chunk_size_seconds(audio_ordering.chunk_beats)
+        source_chunks = self.get_audio_chunks_stereo(chunk_size_seconds=chunk_size_seconds)
         source_embeddings = self.get_audio_features(audio_ordering.chunk_beats)
 
         if smear_modifiers is None:
@@ -182,7 +184,7 @@ class AudioOrderer:
                 save_path, smeared_result, sample_rate=self.sampling_rate, compression=CodecConfig(qscale=0))
             print('saved to', save_path)
 
-        return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
+        return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list, chunk_size_seconds=chunk_size_seconds)
 
 
     def get_audio_chunks_mono(self, chunk_size_seconds: float, window_width_chunks: float=0, waveform: torch.Tensor=None):
@@ -271,6 +273,7 @@ def get_audio_chunks(waveform, sampling_rate, chunk_size_seconds: float,
     for offset in range(0, waveform.shape[0], chunk_size_samples):
         start = offset
         end = offset + chunk_size_samples
+        print('chunk', start, '-', end)
         if end > waveform.shape[0]:
             pad_length = end - waveform.shape[0]
             if wrap_mode == 'wrap':
