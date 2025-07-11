@@ -1,4 +1,7 @@
+from typing import Literal
+
 import fast_tsp, kmedoids
+from tsp_solver.greedy import solve_tsp
 import numpy as np
 import torch
 
@@ -42,6 +45,7 @@ def sort_tsp(embeddings,
              dist_matrix_offset=None,
              pin_first_index: int=None,
              pin_last_index: int=None,
+             backend: Literal['fast-tsp', 'tsp_solver2'] = 'tsp_solver2',
              ) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
     if indices is None:
         indices = torch.arange(embeddings.shape[0])
@@ -49,23 +53,34 @@ def sort_tsp(embeddings,
     if dist_matrix_offset is not None:
         medoids_distance_matrix += dist_matrix_offset
 
-    large_distance = medoids_distance_matrix.max() * 10
-    #if preserve_ends:
-    #    medoids_distance_matrix[0, -1] = large_distance
-    #    medoids_distance_matrix[-1, 0] = large_distance
-    #print("pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
-    if pin_first_index is not None:
-        medoids_distance_matrix[:, pin_first_index] = large_distance
-    if pin_last_index is not None:
-        medoids_distance_matrix[pin_last_index, :] = large_distance
-    #print("after pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
-    medoids_distance_matrix.fill_diagonal_(0)
-
-    # route = solve_mtsp_dynamic_programming(medoids_distance_matrix, 1)
-    # route = solve_tsp_simulated_annealing(medoids_distance_matrix)
     print("computing route")
-    #print(medoids_distance_matrix)
-    route = solve_tsp_fasttsp(medoids_distance_matrix)
+    if backend == 'fast-tsp':
+
+        large_distance = medoids_distance_matrix.max() * 10
+        #if preserve_ends:
+        #    medoids_distance_matrix[0, -1] = large_distance
+        #    medoids_distance_matrix[-1, 0] = large_distance
+        #print("pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
+        if pin_first_index is not None:
+            medoids_distance_matrix[:, pin_first_index] = large_distance
+        if pin_last_index is not None:
+            medoids_distance_matrix[pin_last_index, :] = large_distance
+        #print("after pin:", pin_first_index, pin_last_index, medoids_distance_matrix[:, pin_first_index])
+        medoids_distance_matrix.fill_diagonal_(0)
+
+        # route = solve_mtsp_dynamic_programming(medoids_distance_matrix, 1)
+        # route = solve_tsp_simulated_annealing(medoids_distance_matrix)
+        #print(medoids_distance_matrix)
+        route = solve_tsp_fasttsp(medoids_distance_matrix)
+    elif backend == 'tsp_solver2':
+        if pin_first_index is None:
+            endpoints = None
+        else:
+            assert pin_last_index is not None
+            endpoints = [pin_first_index, pin_last_index]
+        route = solve_tsp(medoids_distance_matrix, endpoints=endpoints)
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
 
     indices_sorted = indices[route]
     if cluster_assignment is None:

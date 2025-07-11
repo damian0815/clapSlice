@@ -273,7 +273,7 @@ def get_audio_chunks(waveform, sampling_rate, chunk_size_seconds: float,
     for offset in range(0, waveform.shape[0], chunk_size_samples):
         start = offset
         end = offset + chunk_size_samples
-        print('chunk', start, '-', end)
+        #print('chunk', start, '-', end)
         if end > waveform.shape[0]:
             pad_length = end - waveform.shape[0]
             if wrap_mode == 'wrap':
@@ -315,13 +315,13 @@ class DynamicSmearer:
                 logits_norm
                 * self.spreads.to(device)
             ).item()
-            print('smear width:', smear_width, ' spread:', spread, end='')
+            #print('smear width:', smear_width, ' spread:', spread, end='')
             smear_width = max(round(smear_width), 0)
             spread = max(round(spread), 0)
-            print(' ->', smear_width, spread)
+            #print(' ->', smear_width, spread)
         else:
             smear_width = self.smear_widths[int(logits_norm.argmax().item())].item()
             spread = self.spreads[int(logits_norm.argmax().item())].item()
-            print('smear width:', smear_width, ' spread:', spread)
+            #print('smear width:', smear_width, ' spread:', spread)
 
         return(smear_width, spread)
