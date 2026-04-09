@@ -65,10 +65,18 @@ class AudioOrderingResult:
 
 class AudioOrderer:
 
-    def __init__(self, clap: CLAPWrapper, source_audio_path: str, bpm: float, first_beat_offset_seconds: float=0):
+    def __init__(
+            self,
+            clap: CLAPWrapper,
+            source_audio_path: str,
+            bpm: float,
+            use_velocity: bool=False,
+            first_beat_offset_seconds: float=0
+    ):
         self.clap = clap
         self.source_audio_path = source_audio_path
         self.bpm = bpm
+        self.use_velocity = use_velocity
         self.first_beat_offset_seconds = first_beat_offset_seconds
 
         waveform, sampling_rate = torchaudio.load(self.source_audio_path)
@@ -86,7 +94,7 @@ class AudioOrderer:
 
 
     def get_audio_features(self, chunk_beats: float, ignore_cache: bool=False, window_width_chunks: float=0, waveform: torch.Tensor=None):
-        features_pickle_filename = self.source_audio_path + f'.clap-norm-bpm{self.bpm}-cb{chunk_beats}-ww{window_width_chunks}-offset{self.first_beat_offset_seconds}.pkl'
+        features_pickle_filename = self.source_audio_path + f'.clap-norm-bpm{self.bpm}-cb{chunk_beats}-ww{window_width_chunks}-offset{self.first_beat_offset_seconds}{'-vel' if self.use_velocity else ''}.pkl'
         if os.path.exists(features_pickle_filename) and not ignore_cache:
             with open(features_pickle_filename, 'rb') as f:
                 return pickle.load(f)
@@ -96,8 +104,14 @@ class AudioOrderer:
             window_width_chunks=window_width_chunks,
             waveform=waveform
         )
-        all_features = torch.concat([self.clap.get_audio_features(chunk, sampling_rate=self.sampling_rate)
-                                     for chunk in tqdm(mono_chunks)])
+        chunk_features = [self.clap.get_audio_features(chunk, sampling_rate=self.sampling_rate)
+                          for chunk in tqdm(mono_chunks)]
+        if self.use_velocity:
+            velocities = [torch.zeros_like(chunk_features[0]) if i==0 else chunk_features[i]-chunk_features[i-1]
+                          for i in range(len(chunk_features))]
+            chunk_features = [torch.cat([chunk_features[i], velocities[i]])
+                              for i in range(len(chunk_features))]
+        all_features = torch.concat(chunk_features)
         with open(features_pickle_filename, 'wb') as f:
             pickle.dump(all_features, f)
 
@@ -138,7 +152,10 @@ class AudioOrderer:
             dynamic_width_cb = None
         else:
             dynamic_smearer = DynamicSmearer(smear_modifiers=smear_modifiers)
-            dynamic_width_cb = lambda source_chunk_index: dynamic_smearer.get_smear_width_and_spread(source_embeddings[source_chunk_index], average=smooth_smear_modifiers)
+            dynamic_width_cb = lambda source_chunk_index: dynamic_smearer.get_smear_width_and_spread(
+                source_embeddings[source_chunk_index],
+                average=smooth_smear_modifiers
+            )
 
         smear_source_list = get_smear_source_list(
             len(order),
@@ -170,7 +187,7 @@ class AudioOrderer:
                     ])
                 #amplitude = source.source_amplitude / len(sources)
                 amplitude = source.source_amplitude
-                #print("source chunk", source.source_chunk_index, ":", source_chunks[source.source_chunk_index].shape, "*", amplitude, zero_crosser.shape)
+                print("source chunk", source.source_chunk_index, ":", source_chunks[source.source_chunk_index].shape, "*", amplitude, zero_crosser.shape)
                 smeared_chunk += source_chunks[source.source_chunk_index] * amplitude * zero_crosser
             smeared_chunks.append(smeared_chunk)
 
@@ -300,12 +317,16 @@ class DynamicSmearer:
         self.smear_widths = torch.tensor([sm.smear_width for sm in smear_modifiers])
         self.spreads = torch.tensor([sm.spread for sm in smear_modifiers])
 
-    def get_smear_width_and_spread(self, match_embedding: torch.Tensor, average=True) -> tuple[float, float]:
+    def get_smear_width_and_spread(
+            self,
+            match_embedding: torch.Tensor,
+            average=True
+    ) -> tuple[float, float]:
         device = match_embedding.device
         logits = match_embedding @ self.smear_modifiers_embeds.to(device).T
         # print(logits)
         # print(logits.softmax(dim=0))
-        logits_norm = logits / logits.sum()
+        logits_norm = logits / logits.sum() if logits.sum().abs() > 0 else logits
         if average:
             smear_width = torch.sum(
                 logits_norm
@@ -315,10 +336,10 @@ class DynamicSmearer:
                 logits_norm
                 * self.spreads.to(device)
             ).item()
-            #print('smear width:', smear_width, ' spread:', spread, end='')
+            print('smear width:', smear_width, ' spread:', spread, end='')
             smear_width = max(round(smear_width), 0)
             spread = max(round(spread), 0)
-            #print(' ->', smear_width, spread)
+            print(' ->', smear_width, spread)
         else:
             smear_width = self.smear_widths[int(logits_norm.argmax().item())].item()
             spread = self.spreads[int(logits_norm.argmax().item())].item()

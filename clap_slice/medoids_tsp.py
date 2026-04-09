@@ -45,7 +45,7 @@ def sort_tsp(embeddings,
              dist_matrix_offset=None,
              pin_first_index: int=None,
              pin_last_index: int=None,
-             backend: Literal['fast-tsp', 'tsp_solver2'] = 'tsp_solver2',
+             backend: Literal['fast-tsp', 'tsp_solver2'] = 'fast-tsp',
              ) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
     if indices is None:
         indices = torch.arange(embeddings.shape[0])
@@ -78,7 +78,9 @@ def sort_tsp(embeddings,
         else:
             assert pin_last_index is not None
             endpoints = [pin_first_index, pin_last_index]
+        print("calling solve_tsp")
         route = solve_tsp(medoids_distance_matrix, endpoints=endpoints)
+        print("called")
     else:
         raise ValueError(f"Unknown backend: {backend}")
 

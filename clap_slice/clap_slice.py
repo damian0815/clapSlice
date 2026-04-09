@@ -21,10 +21,17 @@ class ClapSlice:
         chunk_size_beats: float,
         smear_width: int=2,
         spread: int=0,
+        use_velocity: bool=False,
         smear_modifiers: list[SmearModifier]=None,
         first_beat_offset_seconds: float = 0,
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
-        audio_orderer = AudioOrderer(clap=self.clap, source_audio_path=input_filename, bpm=bpm, first_beat_offset_seconds=first_beat_offset_seconds)
+        audio_orderer = AudioOrderer(
+            clap=self.clap,
+            source_audio_path=input_filename,
+            bpm=bpm,
+            first_beat_offset_seconds=first_beat_offset_seconds,
+            use_velocity=use_velocity
+        )
         sort_order = audio_orderer.make_order(chunk_beats=chunk_size_beats, preserve_start_and_end=True)
         audio_ordering_result = audio_orderer.apply_order(
             audio_ordering=sort_order,
