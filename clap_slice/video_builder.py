@@ -1,5 +1,5 @@
 import math
-from typing import Literal
+from typing import Literal, Optional, List
 
 import torch
 import av
@@ -14,7 +14,7 @@ from clap_slice.video_chunk_cache import VideoChunkCache
 
 
 def add_frames_to_output(
-        output_frames: torch.Tensor|None,
+        output_frames: Optional[torch.Tensor],
         frames: torch.Tensor,
         amplitude: float,
         blend_mode: Literal["add", "max"] = 'add',
@@ -85,8 +85,8 @@ class VideoWriter:
 
 def apply_audio_smear_to_video(video_chunk_cache: VideoChunkCache,
                                video_writer: VideoWriter,
-                               smear_details: list[list[SmearDetails]],
-                               max_chunks_to_write: int|None=None,
+                               smear_details: List[List[SmearDetails]],
+                               max_chunks_to_write: Optional[int]=None,
                                blend_mode: Literal["add", "max"] = 'add'):
     previous_source_indices = set()
     chunk_size_seconds = video_chunk_cache.chunk_size_seconds

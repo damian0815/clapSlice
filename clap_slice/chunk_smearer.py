@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import math
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, Literal
+from typing import Callable, Literal, Union, List, Tuple, Optional
 
 import torch
 
@@ -20,13 +22,13 @@ class SmearDetails:
 
 def get_smear_source_list(
         num_source_chunks: int,
-        sort_order: list[int]|torch.IntTensor,
+        sort_order: Union[List[int], torch.IntTensor],
         smear_width: int = 0,
         spread: int = 0,
         wrap_mode: Literal['wrap', 'bleed', 'cut'] = 'wrap',
         consolidate_smears = True,
         smear_mode: Literal['in', 'in-out'] = 'in-out',
-        dynamic_width_cb: Callable[[int], tuple[int, int]]|None = None,
+        dynamic_width_cb: Optional[Callable[[int], Tuple[int, int]]] = None,
         envelope_shape: Literal['cos_2pi', 'sin_pi', 'log'] = 'cos_2pi'
 ) -> list[list[SmearDetails]]:
 

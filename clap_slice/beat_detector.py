@@ -6,7 +6,7 @@ import numpy as np
 
 
 
-def _detect_beats(audio: str, fps=100) -> np.ndarray:
+def detect_beats(audio: str, fps=100) -> np.ndarray:
     """
     Returns an array of shape (num_downbeats, 2) where the first column is the time of the downbeat in seconds and the second column is the beat number within the bar (starting from 1).
     """
@@ -24,7 +24,7 @@ def slice_at_downbeats(audio_path, fps=100) -> Generator[Tuple[np.ndarray, int, 
     print("loaded")
 
     print("Finding beats...")
-    beat_tracker_output = _detect_beats(audio_path, fps=fps)
+    beat_tracker_output = detect_beats(audio_path, fps=fps)
     downbeat_indices = np.where(beat_tracker_output[:, 1] == 1)[0]
     downbeat_times = beat_tracker_output[downbeat_indices, 0]
     print(f"Fonnd {len(downbeat_times)} downbeats at times: {downbeat_times}")

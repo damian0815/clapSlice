@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Union, Optional
 
 import fast_tsp, kmedoids
 from tsp_solver.greedy import solve_tsp
@@ -40,13 +40,13 @@ def get_distance_matrix(embeddings_a, embeddings_b=None):
 
 
 def sort_tsp(embeddings,
-             indices:torch.IntTensor|None=None,
+             indices: Optional[torch.IntTensor]=None,
              cluster_assignment=None,
              dist_matrix_offset=None,
              pin_first_index: int=None,
              pin_last_index: int=None,
              backend: Literal['fast-tsp', 'tsp_solver2'] = 'fast-tsp',
-             ) -> torch.IntTensor|tuple[torch.IntTensor, torch.Tensor]:
+             ) -> Union[torch.IntTensor, tuple[torch.IntTensor, torch.Tensor]]:
     if indices is None:
         indices = torch.arange(embeddings.shape[0])
     medoids_distance_matrix = get_distance_matrix(embeddings[indices])

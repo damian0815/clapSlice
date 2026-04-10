@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional, List
 
 import torch
 from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
@@ -10,7 +11,7 @@ class CacheItem:
 
 class VideoChunkCache:
 
-    chunks: list[CacheItem]  # chunk_index, data
+    chunks: List[CacheItem]  # chunk_index, data
     video: EncodedVideoPyAV
     chunk_size_seconds: float
     max_cache_size: int
@@ -45,7 +46,7 @@ class VideoChunkCache:
             del self.chunks[0]
         return video_frames
 
-    def _find_chunk(self, index: int) -> torch.Tensor|None:
+    def _find_chunk(self, index: int) -> Optional[torch.Tensor]:
         cache_slot, chunk = next(
             (
                 (cache_slot, chunk)
