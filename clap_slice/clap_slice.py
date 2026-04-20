@@ -1,10 +1,11 @@
 from argparse import ArgumentParser
+from typing import Tuple, List
 
-from pytorchvideo.data.encoded_video import EncodedVideo
-from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
+#from pytorchvideo.data.encoded_video import EncodedVideo
+#from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
 
 from clap_slice.audio_orderer import AudioOrdering, AudioOrderingResult, CLAPWrapper, AudioOrderer
-from clap_slice.video_builder import VideoWriter, apply_audio_smear_to_video
+#from clap_slice.video_builder import VideoWriter, apply_audio_smear_to_video
 from clap_slice import SmearModifier, SmearDetails
 
 
@@ -17,25 +18,28 @@ class ClapSlice:
     def run_audio_ordering(
         self,
         input_filename,
-        beat_times_s: list[float],
-        chunk_size_beats: int,
+        chunk_start_end_times_s: List[Tuple[float, float]],
         smear_width: int=2,
         spread: int=0,
         use_velocity: bool=False,
-        smear_modifiers: list[SmearModifier]=None,
+        stretch: bool=False,
+        smear_modifiers: List[SmearModifier]=None,
+        save_tag: str="no-tag"
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
         audio_orderer = AudioOrderer(
             clap=self.clap,
             source_audio_path=input_filename,
             use_velocity=use_velocity,
-            beat_times_s=beat_times_s,
+            chunk_start_end_times_s=chunk_start_end_times_s,
+            save_tag=save_tag
         )
-        sort_order = audio_orderer.make_order(chunk_beats=chunk_size_beats, preserve_start_and_end=True)
+        sort_order = audio_orderer.make_order(preserve_start_and_end=True)
         audio_ordering_result = audio_orderer.apply_order(
             audio_ordering=sort_order,
             smear_width=smear_width,
             spread=spread,
             wrap_mode='bleed',
+            stretch=stretch,
             save=True,
             smear_modifiers=smear_modifiers,
             smooth_smear_modifiers=True

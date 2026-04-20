@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from typing import Optional, List
 
 import torch
-from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
+#from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
 
 @dataclass
 class CacheItem:
