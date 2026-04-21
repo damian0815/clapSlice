@@ -16,17 +16,13 @@ from clap_slice import SmearModifier
 
 
 
-def clap_slice_handsfree(audio_path,
-                         clap_slice_instance: ClapSlice,
-                         use_velocity=False,
+def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocity=False,
                          smear_modifiers_type: Literal['none', 'sing_vs_instrumental'] = 'sing_vs_instrumental',
                          beat_detection_type: Literal['madmom-dbn', 'beat-this'] = 'beat-this',
-                         beat_detector_rotate: int=0,
-                         features_type: AudioFeaturesType = 'clap',
-                         stretch=False,
+                         beat_detector_rotate: int = 0, features_type: AudioFeaturesType = 'clap', stretch=False,
                          beat_detector_fps=100,
                          hq_audio_path=None,
-                         ):
+                         drop_outlier_pct=0.0):
 
     beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}.beats.npy"
     if os.path.exists(beats_cache_path):
@@ -92,6 +88,7 @@ def clap_slice_handsfree(audio_path,
             stretch=stretch,
             audio_features_type=features_type,
             smear_modifiers=smear_modifiers,
+            drop_outlier_pct=drop_outlier_pct,
         )
 
 
@@ -124,7 +121,7 @@ def _rotate_beats(beat_times_and_indices: np.ndarray, rotation: int):
 if __name__ == "__main__":
 
     arg_parser = ArgumentParser()
-    arg_parser.add_argument("audio_path", type=str)
+    arg_parser.add_argument("audio_path", type=str, help="input audio file")
     arg_parser.add_argument("--use_velocity", action=argparse.BooleanOptionalAction, help="If passed, use intra-feature velocity as well as features when plotting the route")
     arg_parser.add_argument("--stretch", action=argparse.BooleanOptionalAction, help="If passed, resample (stretch) audio to conform bar lengths")
     arg_parser.add_argument("--fps", type=int, default=100, help="frames per second to run the beat detector (default=100)")
@@ -132,6 +129,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--smear_modifiers_type", type=str, choices=['none', 'sing_vs_instrumental'], default='sing_vs_instrumental', help="which smear modifiers to use, if any")
     arg_parser.add_argument("--beat_detection_type", type=str, choices=['madmom-dbn', 'beat-this'], default='beat-this', help="Beat detector, either 'madmom-dbn' or 'beat-this'")
     arg_parser.add_argument("--features_type", type=str, choices=['clap', 'mert'], default='clap', help="Audio features provider, valid values are 'clap' or 'mert'. default: 'clap'")
+    arg_parser.add_argument("--drop_outlier_pct", type=float, default=0.0, help="Drop outlier percentage 0..1 (default=0.0)")
     arg_parser.add_argument("--hq_audio_path", type=str, default=None, help="(Optional) path to hq audio file")
 
 
@@ -146,5 +144,6 @@ if __name__ == "__main__":
                          beat_detector_rotate=args.rotate,
                          smear_modifiers_type=args.smear_modifiers_type, beat_detection_type=args.beat_detection_type,
                          features_type=args.features_type,
-                         hq_audio_path=args.hq_audio_path)
+                         hq_audio_path=args.hq_audio_path,
+                         drop_outlier_pct=args.drop_outlier_pct)
 

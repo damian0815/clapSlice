@@ -1,94 +1,24 @@
-import abc
 import hashlib
 import json
 import os
 import pickle
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import Generator, Literal, Optional, Tuple, List
+from typing import Generator, Literal, Tuple, List
 
 import librosa
-from scipy.signal import resample as scipy_signal_resample
 
 import math
 
-from transformers.modeling_outputs import BaseModelOutputWithPooling
-
-#from torio.io import CodecConfig
-
+from clap_slice.audio_embeddings import CLAPWrapper, MERTWrapper
 from clap_slice.chunk_smearer import get_smear_source_list, SmearDetails
 from clap_slice.medoids_tsp import sort_tsp
 
 import torch
 import torchaudio
 from tqdm.auto import tqdm
-from transformers import ClapModel, ClapFeatureExtractor, AutoTokenizer, AutoModel, Wav2Vec2FeatureExtractor
 
 type AudioFeaturesType = Literal['clap', 'mert']
-
-class AudioEmbeddingsProvider(abc.ABC):
-
-    @abc.abstractmethod
-    def sampling_rate(self) -> int:
-        pass
-
-    @abc.abstractmethod
-    def get_audio_features(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
-        pass
-
-
-class CLAPWrapper(AudioEmbeddingsProvider):
-
-
-    def __init__(self, device='mps'):
-        print("initilizing CLAP")
-        self.model = ClapModel.from_pretrained("laion/clap-htsat-unfused", use_safetensors=True).to(device)
-        self.feature_extractor: ClapFeatureExtractor = ClapFeatureExtractor.from_pretrained("laion/clap-htsat-unfused")
-        self.tokenizer = AutoTokenizer.from_pretrained("laion/clap-htsat-unfused")
-
-    @property
-    def sampling_rate(self) -> int:
-        return self.feature_extractor.sampling_rate
-
-    def get_audio_features(self, waveform: torch.Tensor, sampling_rate):
-        inputs = self.feature_extractor(waveform, sampling_rate=sampling_rate, return_tensors="pt")
-        # print(inputs.keys())
-        audio_features: BaseModelOutputWithPooling = self.model.get_audio_features(input_features=inputs.input_features.to(self.model.device))
-        pooled_audio_features = audio_features.pooler_output
-        return pooled_audio_features / torch.norm(pooled_audio_features, p=2, dim=1, keepdim=True)
-
-    def get_text_features(self, text: str):
-        inputs = self.tokenizer(text, padding=True, return_tensors='pt')
-        text_features: BaseModelOutputWithPooling = self.model.get_text_features(input_ids=inputs.input_ids.to(self.model.device))
-        pooled_text_features = text_features.pooler_output  #  [1, 512]
-        return pooled_text_features / torch.norm(pooled_text_features, p=2, dim=1, keepdim=True)
-
-
-class MERTWrapper(AudioEmbeddingsProvider):
-    def __init__(self, device='mps'):
-        print("initilizing MERT")
-        # loading our model weights
-        self.model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-        # loading the corresponding preprocessor config
-        self.processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
-
-    @property
-    def sampling_rate(self) -> int:
-        return self.processor.sampling_rate
-
-    def get_audio_features(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
-        if sampling_rate != self.sampling_rate:
-            print("resampling from", sampling_rate, "to", self.sampling_rate)
-            resampler = torchaudio.transforms.Resample(sampling_rate, self.sampling_rate)
-            waveform = resampler(waveform)
-
-        inputs = self.processor(waveform, sampling_rate=self.sampling_rate, return_tensors="pt")
-        with torch.no_grad():
-            outputs = self.model(**inputs, output_hidden_states=False)
-            embedding = outputs.last_hidden_state.mean(dim=1) # 1, 768
-            return embedding
-
-
 
 
 @dataclass
@@ -125,6 +55,7 @@ class AudioOrderer:
         chunk_start_end_times_s: List[Tuple[float, float]],
         use_velocity: bool=False,
         features_type: AudioFeaturesType= 'clap',
+        drop_outlier_pct: float=None,
     ):
         self.clap = clap
         self.mert = mert
@@ -132,6 +63,7 @@ class AudioOrderer:
         self.save_tag = save_tag
         self.source_audio_path = source_audio_path
         self.use_velocity = use_velocity
+        self.drop_outlier_pct = drop_outlier_pct
         self.chunk_start_end_times_s = chunk_start_end_times_s
 
         self.waveform, self.sampling_rate = torchaudio.load(self.source_audio_path)
@@ -200,12 +132,38 @@ class AudioOrderer:
 
     def make_order(self, window_width=0, preserve_start_and_end=False) -> AudioOrdering:
         all_features = self.get_audio_features(window_width_chunks=window_width)
-        pin_first_index, pin_last_index = (0, all_features.shape[0] - 1) if preserve_start_and_end else (None, None)
-        sort_order = sort_tsp(all_features, pin_first_index = pin_first_index, pin_last_index = pin_last_index)
+        pin_first_index, pin_last_index = (0, -1) if preserve_start_and_end else (None, None)
+
+        if self.drop_outlier_pct:
+            n = all_features.shape[0]
+            n_drop = max(1, round(n * self.drop_outlier_pct))
+            # Use k-means to find cluster centroids, then drop points farthest from their nearest centroid
+            from sklearn.cluster import KMeans
+            n_clusters = max(1, min(8, n // 4))
+            features_np = all_features.detach().cpu().float().numpy()
+            kmeans = KMeans(n_clusters=n_clusters, n_init='auto', random_state=0).fit(features_np)
+            centroids = torch.tensor(kmeans.cluster_centers_, dtype=all_features.dtype)
+            # distance of each point to its nearest centroid
+            dists = torch.cdist(all_features.cpu().float(), centroids)  # [n, n_clusters]
+            min_dists = dists.min(dim=1).values  # [n]
+            # indices sorted by distance descending — most outlying first
+            sorted_by_dist = torch.argsort(min_dists, descending=True)
+            outlier_indices = set(sorted_by_dist[:n_drop].tolist())
+            kept_indices = [i for i in range(n) if i not in outlier_indices]
+            filtered_features = all_features[kept_indices]
+            section_remap = {new_i: orig_i for new_i, orig_i in enumerate(kept_indices)}
+            print(f"drop_outlier_pct={self.drop_outlier_pct}: dropped {n_drop}/{n} outliers, keeping {len(kept_indices)}")
+        else:
+            filtered_features = all_features
+            section_remap = {i: i for i in range(len(filtered_features))}
+
+        sort_order_raw = sort_tsp(filtered_features, pin_first_index=pin_first_index, pin_last_index=pin_last_index).tolist()
+        sort_order_remapped = torch.tensor([section_remap[i]
+                               for i in sort_order_raw])
         return AudioOrdering(
             source_audio=self.source_audio_path,
             chunk_start_end_times_s=self.chunk_start_end_times_s,
-            sort_order=sort_order,
+            sort_order=sort_order_remapped,
             window_width=window_width,
         )
 
@@ -324,8 +282,12 @@ class AudioOrderer:
         smeared_result = 0.99 * smeared_result / smeared_result.abs().max()
 
         if save:
-            smear_type_str = (f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}') + ("-str" if stretch else "")
-            save_path = self.source_audio_path + f'-sorted-{self.features_type}-bpm{self._estimated_bpm}-{self.save_tag}-ww{audio_ordering.window_width}-smeared-{smear_type_str}.wav'
+            suffix = (
+                (f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}')
+                + ("-str" if stretch else "")
+                + (f"-drop{self.drop_outlier_pct}" if self.drop_outlier_pct > 0 else "")
+            )
+            save_path = self.source_audio_path + f'-sorted-{self.features_type}-bpm{self._estimated_bpm}-{self.save_tag}-ww{audio_ordering.window_width}-smeared-{suffix}.flac'
             if os.path.exists(save_path):
                 os.unlink(save_path)
             torchaudio.save(
@@ -446,13 +408,12 @@ def get_audio_chunks(waveform, sampling_rate,
             chunk_starts_ends_s = [(c[0] + padding_s, c[1] + padding_s)
                                    for c in chunk_starts_ends_s]
 
-    if window_width_chunks != 0:
-        raise NotImplementedError("window_width_chunks not implemented")
-
     # yield the chunks
-    for chunk_start_s, chunk_end_s in tqdm(chunk_starts_ends_s, disable=not show_progress):
-        start = int(chunk_start_s * sampling_rate)
-        end = start + int((chunk_end_s - chunk_start_s) * sampling_rate)
+    for chunk_index, (chunk_start_s, chunk_end_s) in enumerate(tqdm(chunk_starts_ends_s, disable=not show_progress)):
+        chunk_length_samples = get_chunk_size_samples(chunk_index)
+        window_width_samples = round(window_width_chunks * chunk_length_samples)
+        start = int(chunk_start_s * sampling_rate) - window_width_samples
+        end = start + int((chunk_end_s - chunk_start_s) * sampling_rate) + window_width_samples
         if end > waveform.shape[0]:
             pad_length = end - waveform.shape[0]
             if wrap_mode == 'wrap':

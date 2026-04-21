@@ -29,6 +29,8 @@ class ClapSlice:
         smear_modifiers: List[SmearModifier]=None,
         save_tag: str="no-tag",
         hq_audio_path: str=None,
+        drop_outlier_pct: float=0.0,
+        window_width: float=0,
 
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
         audio_orderer = AudioOrderer(
@@ -38,9 +40,13 @@ class ClapSlice:
             use_velocity=use_velocity,
             features_type=audio_features_type,
             chunk_start_end_times_s=chunk_start_end_times_s,
+            drop_outlier_pct=drop_outlier_pct,
             save_tag=save_tag
         )
-        sort_order = audio_orderer.make_order(preserve_start_and_end=True)
+        sort_order = audio_orderer.make_order(
+            preserve_start_and_end=True,
+            window_width=window_width,
+        )
         audio_ordering_result = audio_orderer.apply_order(
             audio_ordering=sort_order,
             smear_width=smear_width,
