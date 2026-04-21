@@ -47,7 +47,7 @@ class ClapSlice:
             preserve_start_and_end=True,
             window_width=window_width,
         )
-        audio_ordering_result = audio_orderer.apply_order(
+        audio_ordering_result = audio_orderer.apply_order_smooth(
             audio_ordering=sort_order,
             smear_width=smear_width,
             spread=spread,

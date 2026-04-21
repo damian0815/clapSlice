@@ -4,14 +4,14 @@ import os
 import pickle
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import Generator, Literal, Tuple, List
+from typing import Generator, Literal, Optional, Tuple, List
 
 import librosa
 
 import math
 
 from clap_slice.audio_embeddings import CLAPWrapper, MERTWrapper
-from clap_slice.chunk_smearer import get_smear_source_list, SmearDetails
+from clap_slice.chunk_smearer import get_smear_source_list, SmearDetails, _build_envelope
 from clap_slice.medoids_tsp import sort_tsp
 
 import torch
@@ -40,7 +40,7 @@ class AudioOrdering:
 @dataclass
 class AudioOrderingResult:
     output_audio: torch.Tensor
-    smear_details: list[SmearDetails]
+    smear_details: Optional[list]  # list[SmearDetails], or None when produced by apply_order_smooth
     #chunk_size_seconds: float
 
 
@@ -295,6 +295,169 @@ class AudioOrderer:
             print('saved to', save_path)
 
         return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
+
+    def apply_order_smooth(self,
+                           audio_ordering: AudioOrdering,
+                           smear_width: int = 2,
+                           spread: int = 0,
+                           stretch: bool = False,
+                           wrap_mode: Literal['wrap', 'cut', 'bleed'] = 'wrap',
+                           envelope_shape: Literal['cos_2pi', 'sin_pi', 'log'] = 'log',
+                           smear_modifiers: list[SmearModifier] = None,
+                           smooth_smear_modifiers: bool = True,
+                           save: bool = False,
+                           hq_audio_path: str = None,
+                           ) -> AudioOrderingResult:
+        """
+        Buffer-first variant of apply_order. Pre-allocates the full output buffer and writes each
+        source chunk into it additively across all its smear/spread positions. A matching accumulator
+        buffer tracks the sum of envelope amplitudes at every sample so that transitions are
+        normalised continuously rather than per-chunk, eliminating onset artifacts at chunk boundaries.
+
+        Assumes all source chunks have the same sample length.
+        """
+        order = audio_ordering.sort_order
+        if isinstance(order, torch.Tensor):
+            order = order.tolist()
+        num_output_slots = len(order)
+
+        hq_waveform, hq_sampling_rate = None, None
+        if hq_audio_path is not None:
+            hq_waveform, hq_sampling_rate = torchaudio.load(hq_audio_path)
+
+        source_chunks = self.get_audio_chunks_stereo(
+            self.chunk_start_end_times_s,
+            stretch=stretch,
+            waveform=hq_waveform,
+            sampling_rate=hq_sampling_rate,
+        )
+        num_source_chunks = len(source_chunks)
+        chunk_samples = source_chunks[0].shape[1]  # all chunks assumed equal length
+
+        # Set up dynamic width callback if needed (mirrors apply_order logic)
+        source_embeddings = self.get_audio_features()
+        if smear_modifiers is None:
+            dynamic_width_cb = None
+        else:
+            dynamic_smearer = DynamicSmearer(smear_modifiers=smear_modifiers)
+            if self.features_type == 'clap':
+                clap_embeddings = source_embeddings
+            else:
+                resampled_waveform = self._resample_waveform_if_necessary(self.clap.sampling_rate)
+                clap_embeddings = self.get_audio_features(
+                    features_type='clap',
+                    waveform=resampled_waveform,
+                    sampling_rate=self.clap.sampling_rate,
+                )
+            dynamic_width_cb = lambda source_chunk_index: dynamic_smearer.get_smear_width_and_spread(
+                clap_embeddings[source_chunk_index],
+                average=smooth_smear_modifiers,
+            )
+
+        # --- Pass 1: resolve (sw, sp) per position so we can size the output buffer exactly ---
+        per_position_sw_sp = []
+        for position_idx, source_chunk_idx in enumerate(order):
+            if dynamic_width_cb is not None:
+                sw, sp = dynamic_width_cb(source_chunk_idx)
+                sw, sp = round(sw), round(sp)
+            else:
+                sw, sp = smear_width, spread
+            per_position_sw_sp.append((sw, sp))
+
+        # Log smear/spread statistics
+        all_sws = [sw for sw, _ in per_position_sw_sp]
+        all_sps = [sp for _, sp in per_position_sw_sp]
+        sw_counts = {}
+        sp_counts = {}
+        for sw in all_sws:
+            sw_counts[sw] = sw_counts.get(sw, 0) + 1
+        for sp in all_sps:
+            sp_counts[sp] = sp_counts.get(sp, 0) + 1
+        print(f"apply_order_smooth: {num_output_slots} output slots, chunk_samples={chunk_samples}")
+        print(f"  smear_width — min={min(all_sws)}, max={max(all_sws)}, mean={sum(all_sws)/len(all_sws):.2f}, "
+              f"median={sorted(all_sws)[len(all_sws)//2]}, "
+              f"distribution={dict(sorted(sw_counts.items()))}")
+        print(f"  spread      — min={min(all_sps)}, max={max(all_sps)}, mean={sum(all_sps)/len(all_sps):.2f}, "
+              f"median={sorted(all_sps)[len(all_sps)//2]}, "
+              f"distribution={dict(sorted(sp_counts.items()))}")
+
+        # Compute the minimum and maximum output-slot index that any source chunk will write to.
+        # For position k with smear_width sw, writes land on slots k-sw … k+sw.
+        min_slot = min(position_idx - sw for position_idx, (sw, _) in enumerate(per_position_sw_sp))
+        max_slot = max(position_idx + sw for position_idx, (sw, _) in enumerate(per_position_sw_sp))
+
+        pre_pad  = max(0, -min_slot)               # extra slots prepended
+        post_pad = max(0, max_slot - (num_output_slots - 1))  # extra slots appended
+        total_slots = num_output_slots + pre_pad + post_pad
+        total_samples = total_slots * chunk_samples
+        print(f"  buffer: pre_pad={pre_pad} slots, post_pad={post_pad} slots → "
+              f"total {total_slots} slots ({total_samples} samples)")
+
+        output_buffer = torch.zeros(2, total_samples)
+        # accumulator tracks the sum of envelope amplitudes at each sample position, used for
+        # per-sample normalisation so loudness is flat across smear/spread overlap zones.
+        accumulator = torch.zeros(1, total_samples)
+
+        # --- Pass 2: write each source chunk into the buffer ---
+        for position_idx, (source_chunk_idx, (sw, sp)) in enumerate(zip(order, per_position_sw_sp)):
+            envelope = _build_envelope(envelope_shape, sw, 'in-out')  # length 2*sw+1
+
+            for smear_slot_i, smear_slot in enumerate(range(-sw, sw + 1)):
+                amp = envelope[smear_slot_i].item()
+                if amp == 0:
+                    continue
+
+                # raw target slot in sort_order space; offset by pre_pad for buffer indexing
+                target_slot_logical = position_idx + smear_slot
+                if wrap_mode == 'wrap':
+                    target_slot_logical = target_slot_logical % num_output_slots
+                elif target_slot_logical < -pre_pad or target_slot_logical >= num_output_slots + post_pad:
+                    continue  # genuinely out of range even with padding
+
+                target_slot_buf = target_slot_logical + pre_pad
+                target_start = target_slot_buf * chunk_samples
+                target_end = target_start + chunk_samples
+
+                for spread_slot in range(-sp, sp + 1):
+                    actual_source_idx = source_chunk_idx + spread_slot
+                    if wrap_mode == 'wrap':
+                        actual_source_idx = actual_source_idx % num_source_chunks
+                    elif actual_source_idx < 0 or actual_source_idx >= num_source_chunks:
+                        continue
+
+                    src = source_chunks[actual_source_idx]  # [2, chunk_samples]
+                    # guard against rare off-by-one chunk lengths
+                    if src.shape[1] != chunk_samples:
+                        src = torch.nn.functional.pad(src[:, :chunk_samples],
+                                                      (0, max(0, chunk_samples - src.shape[1])))
+
+                    output_buffer[:, target_start:target_end] += src * amp
+                    accumulator[:, target_start:target_end] += amp
+
+        # Per-sample normalisation: divide by the accumulated envelope weight so that every
+        # sample position reflects its "fair share" of amplitude regardless of how many
+        # smear/spread sources overlap there.
+        output_buffer = output_buffer / accumulator.clamp(min=1e-6)
+
+        # Final peak normalisation
+        output_buffer = 0.99 * output_buffer / output_buffer.abs().max()
+
+        if save:
+            suffix = (
+                (f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}')
+                + ("-str" if stretch else "")
+                + (f"-drop{self.drop_outlier_pct}" if self.drop_outlier_pct and self.drop_outlier_pct > 0 else "")
+                + "-smooth"
+            )
+            save_path = (self.source_audio_path
+                         + f'-sorted-{self.features_type}-bpm{self._estimated_bpm}'
+                         + f'-{self.save_tag}-ww{audio_ordering.window_width}-smeared-{suffix}.flac')
+            if os.path.exists(save_path):
+                os.unlink(save_path)
+            torchaudio.save(save_path, output_buffer, sample_rate=self.sampling_rate)
+            print('saved to', save_path)
+
+        return AudioOrderingResult(output_audio=output_buffer, smear_details=None)
 
     def _resample_waveform_if_necessary(self, target_sampling_rate):
         return type(self).__resample_waveform_if_necessary(self.waveform, self.sampling_rate, target_sampling_rate)
