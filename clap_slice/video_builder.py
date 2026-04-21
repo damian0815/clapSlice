@@ -88,7 +88,6 @@ def apply_audio_smear_to_video(video_chunk_cache: VideoChunkCache,
                                smear_details: List[List[SmearDetails]],
                                max_chunks_to_write: Optional[int]=None,
                                blend_mode: Literal["add", "max"] = 'add'):
-    previous_source_indices = set()
     chunk_size_seconds = video_chunk_cache.chunk_size_seconds
 
     max_amplitude = max([max(smears, key=lambda x: x.source_amplitude).source_amplitude

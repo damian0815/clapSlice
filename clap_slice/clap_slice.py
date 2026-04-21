@@ -4,7 +4,8 @@ from typing import Tuple, List
 #from pytorchvideo.data.encoded_video import EncodedVideo
 #from pytorchvideo.data.encoded_video_pyav import EncodedVideoPyAV
 
-from clap_slice.audio_orderer import AudioOrdering, AudioOrderingResult, CLAPWrapper, AudioOrderer
+from clap_slice.audio_orderer import AudioOrdering, AudioOrderingResult, CLAPWrapper, AudioOrderer, AudioFeaturesType, \
+    MERTWrapper
 #from clap_slice.video_builder import VideoWriter, apply_audio_smear_to_video
 from clap_slice import SmearModifier, SmearDetails
 
@@ -13,6 +14,7 @@ class ClapSlice:
 
     def __init__(self, registry_root='./audio_ordering_candidates_registry'):
         self.clap = CLAPWrapper()
+        self.mert = MERTWrapper()
         self.registry_root = registry_root
 
     def run_audio_ordering(
@@ -23,13 +25,18 @@ class ClapSlice:
         spread: int=0,
         use_velocity: bool=False,
         stretch: bool=False,
+        audio_features_type: AudioFeaturesType='clap',
         smear_modifiers: List[SmearModifier]=None,
-        save_tag: str="no-tag"
+        save_tag: str="no-tag",
+        hq_audio_path: str=None,
+
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
         audio_orderer = AudioOrderer(
             clap=self.clap,
+            mert=self.mert,
             source_audio_path=input_filename,
             use_velocity=use_velocity,
+            features_type=audio_features_type,
             chunk_start_end_times_s=chunk_start_end_times_s,
             save_tag=save_tag
         )
@@ -42,7 +49,8 @@ class ClapSlice:
             stretch=stretch,
             save=True,
             smear_modifiers=smear_modifiers,
-            smooth_smear_modifiers=True
+            smooth_smear_modifiers=True,
+            hq_audio_path=hq_audio_path,
         )
         return sort_order, audio_ordering_result
 

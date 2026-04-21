@@ -1,3 +1,4 @@
+import abc
 import hashlib
 import json
 import os
@@ -21,10 +22,23 @@ from clap_slice.medoids_tsp import sort_tsp
 import torch
 import torchaudio
 from tqdm.auto import tqdm
-from transformers import ClapModel, ClapFeatureExtractor, AutoTokenizer
+from transformers import ClapModel, ClapFeatureExtractor, AutoTokenizer, AutoModel, Wav2Vec2FeatureExtractor
+
+type AudioFeaturesType = Literal['clap', 'mert']
+
+class AudioEmbeddingsProvider(abc.ABC):
+
+    @abc.abstractmethod
+    def sampling_rate(self) -> int:
+        pass
+
+    @abc.abstractmethod
+    def get_audio_features(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+        pass
 
 
-class CLAPWrapper:
+class CLAPWrapper(AudioEmbeddingsProvider):
+
 
     def __init__(self, device='mps'):
         print("initilizing CLAP")
@@ -46,8 +60,35 @@ class CLAPWrapper:
     def get_text_features(self, text: str):
         inputs = self.tokenizer(text, padding=True, return_tensors='pt')
         text_features: BaseModelOutputWithPooling = self.model.get_text_features(input_ids=inputs.input_ids.to(self.model.device))
-        pooled_text_features = text_features.pooler_output
+        pooled_text_features = text_features.pooler_output  #  [1, 512]
         return pooled_text_features / torch.norm(pooled_text_features, p=2, dim=1, keepdim=True)
+
+
+class MERTWrapper(AudioEmbeddingsProvider):
+    def __init__(self, device='mps'):
+        print("initilizing MERT")
+        # loading our model weights
+        self.model = AutoModel.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
+        # loading the corresponding preprocessor config
+        self.processor = Wav2Vec2FeatureExtractor.from_pretrained("m-a-p/MERT-v1-95M", trust_remote_code=True)
+
+    @property
+    def sampling_rate(self) -> int:
+        return self.processor.sampling_rate
+
+    def get_audio_features(self, waveform: torch.Tensor, sampling_rate: int) -> torch.Tensor:
+        if sampling_rate != self.sampling_rate:
+            print("resampling from", sampling_rate, "to", self.sampling_rate)
+            resampler = torchaudio.transforms.Resample(sampling_rate, self.sampling_rate)
+            waveform = resampler(waveform)
+
+        inputs = self.processor(waveform, sampling_rate=self.sampling_rate, return_tensors="pt")
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=False)
+            embedding = outputs.last_hidden_state.mean(dim=1) # 1, 768
+            return embedding
+
+
 
 
 @dataclass
@@ -78,60 +119,82 @@ class AudioOrderer:
     def __init__(
         self,
         clap: CLAPWrapper,
+        mert: MERTWrapper,
         source_audio_path: str,
         save_tag: str, # added to wav output filename
         chunk_start_end_times_s: List[Tuple[float, float]],
         use_velocity: bool=False,
+        features_type: AudioFeaturesType= 'clap',
     ):
         self.clap = clap
+        self.mert = mert
+        self.features_type = features_type
         self.save_tag = save_tag
         self.source_audio_path = source_audio_path
         self.use_velocity = use_velocity
         self.chunk_start_end_times_s = chunk_start_end_times_s
 
-        waveform, sampling_rate = torchaudio.load(self.source_audio_path)
-        if sampling_rate != clap.sampling_rate:
-            resampler = torchaudio.transforms.Resample(sampling_rate, clap.sampling_rate, dtype=waveform.dtype)
-            waveform, sampling_rate = resampler(waveform), clap.sampling_rate
-        self.waveform = waveform
-        self.sampling_rate = sampling_rate
-
-        print('loaded waveform with shape', waveform.shape, ', sampling rate', sampling_rate)
+        self.waveform, self.sampling_rate = torchaudio.load(self.source_audio_path)
+        print('loaded waveform with shape', self.waveform.shape, ', sampling rate', self.sampling_rate)
 
     @property
     def _estimated_bpm(self) -> float:
         return mean(self.chunk_start_end_times_s[i][0] - self.chunk_start_end_times_s[i - 1][0] for i in range(1, len(self.chunk_start_end_times_s)))
 
-    def _make_features_pickle_filename_suffix(self, window_width_chunks):
+    def _make_features_pickle_filename_suffix(self, window_width_chunks, features_type, sampling_rate):
         json_blob = json.dumps(self.chunk_start_end_times_s, separators=(',', ':'))
         chunk_start_end_times_hash_digest = hashlib.sha256(json_blob.encode()).hexdigest()
-        return f'.clap-norm-{chunk_start_end_times_hash_digest}-ww{window_width_chunks}{"-vel" if self.use_velocity else ""}.pkl'
+        return f'.clap-norm-{chunk_start_end_times_hash_digest}-ww{window_width_chunks}-sr{sampling_rate}-{features_type}{"-vel" if self.use_velocity else ""}.pkl'
 
-    def get_audio_features(self, ignore_cache: bool=False, window_width_chunks: float=0, waveform: torch.Tensor=None, stretch=False) -> torch.Tensor:
+    def get_audio_features(self, ignore_cache: bool=False, window_width_chunks: float=0, waveform: torch.Tensor=None, sampling_rate=None, stretch=False, features_type: AudioFeaturesType=None) -> torch.Tensor:
         # pickle is important for performance as we don't cache the result internally
-        features_pickle_filename = self.source_audio_path + self._make_features_pickle_filename_suffix(window_width_chunks)
+        if waveform is None:
+            waveform = self.waveform
+            if sampling_rate is not None:
+                raise ValueError("sampling_rate arg must not be passed when using instance waveform")
+            sampling_rate = self.sampling_rate
+        else:
+            if sampling_rate is None:
+                raise ValueError("if passing waveform, you must pass sampling_rate")
+
+        if features_type is None:
+            features_type = self.features_type
+        features_pickle_filename = self.source_audio_path + self._make_features_pickle_filename_suffix(features_type, window_width_chunks, sampling_rate)
         if os.path.exists(features_pickle_filename) and not ignore_cache:
             with open(features_pickle_filename, 'rb') as f:
                 return pickle.load(f)
 
+        features_sampling_rate = self.clap.sampling_rate if features_type == 'clap' else self.mert.sampling_rate
+        waveform = self._resample_waveform_if_necessary(features_sampling_rate)
         mono_chunks = self.get_audio_chunks_mono(
             chunk_starts_ends_s=self.chunk_start_end_times_s,
             window_width_chunks=window_width_chunks,
             waveform=waveform,
+            sampling_rate=features_sampling_rate,
             stretch=stretch
         )
-        chunk_features = [self.clap.get_audio_features(chunk, sampling_rate=self.sampling_rate)
+        audio_embedding_provider = self.mert if features_type == 'mert' else self.clap
+        all_features = type(self)._get_audio_features(
+            mono_chunks,
+            sampling_rate=features_sampling_rate,
+            audio_embedding_provider=audio_embedding_provider,
+            use_velocity=self.use_velocity)
+        with open(features_pickle_filename, 'wb') as f:
+            pickle.dump(all_features, f)
+        return all_features
+
+
+    @staticmethod
+    def _get_audio_features(mono_chunks, audio_embedding_provider, sampling_rate, use_velocity) -> torch.Tensor:
+        chunk_features = [audio_embedding_provider.get_audio_features(chunk, sampling_rate=sampling_rate)
                           for chunk in tqdm(mono_chunks)]
-        if self.use_velocity:
+        if use_velocity:
             velocities = [torch.zeros_like(chunk_features[0]) if i==0 else chunk_features[i]-chunk_features[i-1]
                           for i in range(len(chunk_features))]
             chunk_features = velocities
             #chunk_features = [torch.cat([chunk_features[i], velocities[i]])
             #                  for i in range(len(chunk_features))]
         all_features = torch.concat(chunk_features)
-        with open(features_pickle_filename, 'wb') as f:
-            pickle.dump(all_features, f)
-
         return all_features
 
 
@@ -156,13 +219,21 @@ class AudioOrderer:
                     envelope_shape: Literal['cos_2pi', 'sin_pi', 'log']='log',
                     smear_modifiers: list[SmearModifier] = None,
                     smooth_smear_modifiers: bool = True,
-                    save: bool = False
+                    save: bool = False,
+                    hq_audio_path: str=None
         ) -> AudioOrderingResult:
 
         order = audio_ordering.sort_order
+
+        hq_waveform, hq_sampling_rate = None, None
+        if hq_audio_path is not None:
+            hq_waveform, hq_sampling_rate = torchaudio.load(hq_audio_path)
+
         source_chunks = self.get_audio_chunks_stereo(
             self.chunk_start_end_times_s,
-            stretch=stretch
+            stretch=stretch,
+            waveform=hq_waveform,
+            sampling_rate=hq_sampling_rate
         )
         source_embeddings = self.get_audio_features()
 
@@ -170,8 +241,13 @@ class AudioOrderer:
             dynamic_width_cb = None
         else:
             dynamic_smearer = DynamicSmearer(smear_modifiers=smear_modifiers)
+            if self.features_type == 'clap':
+                clap_embeddings = source_embeddings
+            else:
+                resampled_waveform = self._resample_waveform_if_necessary(self.clap.sampling_rate)
+                clap_embeddings = self.get_audio_features(features_type='clap', waveform=resampled_waveform, sampling_rate=self.clap.sampling_rate)
             dynamic_width_cb = lambda source_chunk_index: dynamic_smearer.get_smear_width_and_spread(
-                source_embeddings[source_chunk_index],
+                clap_embeddings[source_chunk_index],
                 average=smooth_smear_modifiers
             )
 
@@ -249,7 +325,7 @@ class AudioOrderer:
 
         if save:
             smear_type_str = (f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}') + ("-str" if stretch else "")
-            save_path = self.source_audio_path + f'-sorted-bpm{self._estimated_bpm}-{self.save_tag}-ww{audio_ordering.window_width}-smeared-{smear_type_str}.wav'
+            save_path = self.source_audio_path + f'-sorted-{self.features_type}-bpm{self._estimated_bpm}-{self.save_tag}-ww{audio_ordering.window_width}-smeared-{smear_type_str}.wav'
             if os.path.exists(save_path):
                 os.unlink(save_path)
             torchaudio.save(
@@ -258,13 +334,24 @@ class AudioOrderer:
 
         return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
 
+    def _resample_waveform_if_necessary(self, target_sampling_rate):
+        return type(self).__resample_waveform_if_necessary(self.waveform, self.sampling_rate, target_sampling_rate)
 
-    def get_audio_chunks_mono(self, chunk_starts_ends_s: List[Tuple[float, float]], window_width_chunks: float=0, waveform: torch.Tensor=None, stretch=False):
-        waveform = waveform or self.waveform
+    @staticmethod
+    def __resample_waveform_if_necessary(waveform, current_sampling_rate, target_sampling_rate) -> torch.Tensor:
+        if current_sampling_rate == target_sampling_rate:
+            return waveform
+        resampler = torchaudio.transforms.Resample(current_sampling_rate, target_sampling_rate, dtype=waveform.dtype)
+        return resampler(waveform)
+
+
+    def get_audio_chunks_mono(self, chunk_starts_ends_s: List[Tuple[float, float]], window_width_chunks: float=0, waveform: torch.Tensor=None, sampling_rate: int=None, stretch=False):
+        waveform = self.waveform if waveform is None else waveform
+        sampling_rate = sampling_rate or self.sampling_rate
         left_chunks_window = list(
             get_audio_chunks(
                 waveform[0],
-                sampling_rate=self.sampling_rate,
+                sampling_rate=sampling_rate,
                 chunk_starts_ends_s=chunk_starts_ends_s,
                 window_width_chunks=window_width_chunks,
                 stretch=stretch
@@ -276,7 +363,7 @@ class AudioOrderer:
             right_chunks_window = list(
                 get_audio_chunks(
                     waveform[1],
-                    sampling_rate=self.sampling_rate,
+                    sampling_rate=sampling_rate,
                     chunk_starts_ends_s=chunk_starts_ends_s,
                     window_width_chunks=window_width_chunks,
                     stretch=stretch
@@ -287,12 +374,20 @@ class AudioOrderer:
         return mono_chunks
 
 
-    def get_audio_chunks_stereo(self, chunk_starts_ends_s: List[Tuple[float, float]], window_width_chunks: float=0, waveform: torch.Tensor=None, stretch=False):
-        waveform = waveform or self.waveform
+    def get_audio_chunks_stereo(self, chunk_starts_ends_s: List[Tuple[float, float]], window_width_chunks: float=0, waveform: torch.Tensor=None, sampling_rate: int=None, stretch=False):
+        if waveform is None:
+            waveform = self.waveform
+            if sampling_rate is not None:
+                raise ValueError("Sampling rate must be None if waveform is None")
+            sampling_rate = self.sampling_rate
+        else:
+            if sampling_rate is None:
+                raise ValueError("If waveform is not None you must provide a sampling_rate")
+
         left_chunks_no_window = list(
             get_audio_chunks(
                 waveform[0],
-                sampling_rate=self.sampling_rate,
+                sampling_rate=sampling_rate,
                 chunk_starts_ends_s=chunk_starts_ends_s,
                 window_width_chunks=window_width_chunks,
                 stretch=stretch
@@ -301,7 +396,7 @@ class AudioOrderer:
         right_chunks_no_window = list(
             get_audio_chunks(
                 waveform[1],
-                sampling_rate=self.sampling_rate,
+                sampling_rate=sampling_rate,
                 chunk_starts_ends_s=chunk_starts_ends_s,
                 window_width_chunks=window_width_chunks,
                 stretch=stretch
