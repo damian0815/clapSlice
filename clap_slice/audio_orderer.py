@@ -296,15 +296,199 @@ class AudioOrderer:
 
         return AudioOrderingResult(output_audio=smeared_result, smear_details=smear_source_list)
 
+    @staticmethod
+    def _make_stepped_spread_envelope(
+            total_width: int,
+            chunk_samples: int,
+            ramp_frac: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        Build a stepped amplitude envelope for a multi-chunk spread read.
+
+        The total span is `total_width` samples.  `chunk_samples` is the core chunk size and
+        defines the step boundaries.  The envelope mirrors the core level (1.0) outward in
+        integer-chunk steps:  1/(N), 2/(N), …, 1.0, …, 2/(N), 1/(N)  where N = extra_chunks+1.
+
+        Transition placement (asymmetric, to avoid audible clicks at chunk edges):
+          • Rising transitions  → placed at the END   of the lower-amplitude chunk
+          • Falling transitions → placed at the START of the lower-amplitude chunk
+          • First chunk edge (from silence) → ramp at START of chunk 0
+          • Last  chunk edge (to  silence)  → ramp at END   of last chunk
+        """
+        total_chunks = total_width // chunk_samples
+        extra_chunks = (total_chunks - 1) // 2   # integer extra chunks on each side
+
+        if extra_chunks == 0:
+            return torch.ones(total_width)
+
+        ramp_samples = max(1, round(ramp_frac * chunk_samples))
+        N = extra_chunks + 1   # amplitude level denominator
+
+        def level(c: int) -> int:
+            return extra_chunks + 1 - abs(c - extra_chunks)
+
+        def amp(c: int) -> float:
+            return level(c) / N
+
+        parts: list[torch.Tensor] = []
+        for c in range(total_chunks):
+            A_c    = amp(c)
+            A_prev = 0.0 if c == 0                  else amp(c - 1)
+            A_next = 0.0 if c == total_chunks - 1   else amp(c + 1)
+
+            # start ramp: first chunk (from silence) OR level is falling from previous chunk
+            has_start_ramp = (c == 0) or (level(c) < level(c - 1))
+            # end ramp:   last chunk (to silence)   OR level is rising into next chunk
+            has_end_ramp   = (c == total_chunks - 1) or (level(c) < level(c + 1))
+
+            r_s    = ramp_samples if has_start_ramp else 0
+            r_e    = ramp_samples if has_end_ramp   else 0
+            flat_n = max(0, chunk_samples - r_s - r_e)
+
+            if has_start_ramp:
+                parts.append(torch.linspace(A_prev, A_c, r_s))
+            parts.append(torch.full((flat_n,), A_c))
+            if has_end_ramp:
+                parts.append(torch.linspace(A_c, A_next, r_e))
+
+        env = torch.cat(parts)
+        # guard against integer rounding mismatches
+        if env.shape[0] > total_width:
+            env = env[:total_width]
+        elif env.shape[0] < total_width:
+            env = torch.nn.functional.pad(env, (0, total_width - env.shape[0]))
+        return env
+
+    def _compute_padded_chunk_times(self, sampling_rate: int) -> List[Tuple[float, float]]:
+        """
+        Replicate the padding logic inside get_audio_chunks so that the returned list of
+        (start_s, end_s) tuples matches the index space used when features were computed.
+        Specifically: prepends synthetic chunks for any audio before the first beat, then
+        drops the trailing chunk (matching the [:-1] slice in get_audio_chunks_mono/stereo).
+        The result can be indexed by any sort_order value produced by make_order.
+        """
+        chunk_starts_ends_s: List[Tuple[float, float]] = list(self.chunk_start_end_times_s)
+
+        def chunk_size_samples(i: int) -> int:
+            return round(sampling_rate * (chunk_starts_ends_s[i][1] - chunk_starts_ends_s[i][0]))
+
+        first_beat_offset_samples = round(chunk_starts_ends_s[0][0] * sampling_rate)
+        avg_chunk_len = int(median(chunk_size_samples(i) for i in range(len(chunk_starts_ends_s))))
+
+        while first_beat_offset_samples > 0:
+            prev = first_beat_offset_samples
+            first_beat_offset_samples -= avg_chunk_len
+            chunk_starts_ends_s = [(first_beat_offset_samples / sampling_rate,
+                                    prev / sampling_rate)] + chunk_starts_ends_s
+
+        if first_beat_offset_samples < 0:
+            padding_s = (-first_beat_offset_samples) / sampling_rate
+            chunk_starts_ends_s = [(s + padding_s, e + padding_s) for s, e in chunk_starts_ends_s]
+
+        return chunk_starts_ends_s[:-1]   # drop trailing chunk, matching [:-1] in chunk loaders
+
+    def _read_stereo_chunk(
+            self,
+            waveform: torch.Tensor,
+            sampling_rate: int,
+            chunk_idx: int,
+            wrap_mode: Literal['wrap', 'bleed', 'cut'],
+            stretch: bool,
+            target_samples: int,
+            spread: float = 1.0,
+            chunk_times: Optional[List[Tuple[float, float]]] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Read one stereo chunk from the waveform, expanded by `spread` on each side.
+          spread=1.0 → exact chunk boundaries, no fade
+          spread=1.1 → 5% extra on each side, cosine-faded to zero at the edges
+
+        Returns:
+          audio    [2, out_width]  — spread audio with fade envelope applied
+          envelope [out_width]     — the per-sample fade weights (for accumulator normalisation)
+
+        out_width = round(spread * target_samples).  The core chunk occupies the
+        middle target_samples of the output; the fade margins extend beyond that.
+        chunk_times overrides self.chunk_start_end_times_s — pass the padded list from
+        _compute_padded_chunk_times() so that feature-space indices resolve correctly.
+        """
+        times = chunk_times if chunk_times is not None else self.chunk_start_end_times_s
+        start_s, end_s = times[chunk_idx]
+        core_dur_s = end_s - start_s
+        extra_s = (spread - 1.0) / 2.0 * core_dur_s   # extra time on each side
+
+        read_start = round((start_s - extra_s) * sampling_rate)
+        read_end   = round((end_s   + extra_s) * sampling_rate)
+        num_wf_samples = waveform.shape[1]
+
+        # --- safe slice with wrap/bleed/cut at both edges ---
+        def _safe_slice(s: int, e: int) -> torch.Tensor:
+            length = e - s
+            if length <= 0:
+                return torch.zeros(2, 0)
+            # handle underflow (s < 0)
+            if s < 0:
+                if wrap_mode == 'wrap':
+                    prefix = waveform[:, s % num_wf_samples:]
+                else:
+                    prefix = torch.zeros(2, -s)
+                rest = _safe_slice(0, e)
+                return torch.cat([prefix, rest], dim=1)[:, :length]
+            # handle overflow (e > num_wf_samples)
+            if e > num_wf_samples:
+                overflow = e - num_wf_samples
+                body = waveform[:, s:]
+                if wrap_mode == 'wrap':
+                    tail = waveform[:, :overflow % num_wf_samples]
+                elif wrap_mode == 'bleed':
+                    tail = torch.zeros(2, overflow)
+                else:  # cut
+                    tail = torch.zeros(2, overflow)
+                return torch.cat([body, tail], dim=1)
+            return waveform[:, s:e]
+
+        raw = _safe_slice(read_start, read_end)   # [2, ~total_width]
+
+        # --- stepped amplitude envelope over the spread margins ---
+        core_samples = round(core_dur_s * sampling_rate)
+        total_width  = raw.shape[1]
+        envelope_1d  = self._make_stepped_spread_envelope(total_width, core_samples)
+
+        raw = raw * envelope_1d.unsqueeze(0)   # apply fade in-place
+
+        # --- stretch / trim / pad to the desired output width ---
+        out_width = round(spread * target_samples)
+
+        if stretch and raw.shape[1] != out_width:
+            rate = 0.999 * raw.shape[1] / out_width
+            left  = torch.tensor(librosa.util.fix_length(
+                librosa.effects.time_stretch(raw[0].numpy(), rate=rate), size=out_width))
+            right = torch.tensor(librosa.util.fix_length(
+                librosa.effects.time_stretch(raw[1].numpy(), rate=rate), size=out_width))
+            raw = torch.stack([left, right])
+            envelope_1d = torch.nn.functional.interpolate(
+                envelope_1d.view(1, 1, -1).float(), size=out_width,
+                mode='linear', align_corners=False).squeeze()
+        elif raw.shape[1] > out_width:
+            raw         = raw[:, :out_width]
+            envelope_1d = envelope_1d[:out_width]
+        elif raw.shape[1] < out_width:
+            pad = out_width - raw.shape[1]
+            raw         = torch.nn.functional.pad(raw, (0, pad))
+            envelope_1d = torch.nn.functional.pad(envelope_1d, (0, pad))
+
+        return raw, envelope_1d   # [2, out_width], [out_width]
+
     def apply_order_smooth(self,
                            audio_ordering: AudioOrdering,
                            smear_width: int = 2,
-                           spread: int = 0,
+                           spread: float = 1.0,
                            stretch: bool = False,
                            wrap_mode: Literal['wrap', 'cut', 'bleed'] = 'wrap',
                            envelope_shape: Literal['cos_2pi', 'sin_pi', 'log'] = 'log',
                            smear_modifiers: list[SmearModifier] = None,
                            smooth_smear_modifiers: bool = True,
+                           rms_normalize_chunks: bool = False,
                            save: bool = False,
                            hq_audio_path: str = None,
                            ) -> AudioOrderingResult:
@@ -325,14 +509,19 @@ class AudioOrderer:
         if hq_audio_path is not None:
             hq_waveform, hq_sampling_rate = torchaudio.load(hq_audio_path)
 
-        source_chunks = self.get_audio_chunks_stereo(
-            self.chunk_start_end_times_s,
-            stretch=stretch,
-            waveform=hq_waveform,
-            sampling_rate=hq_sampling_rate,
-        )
-        num_source_chunks = len(source_chunks)
-        chunk_samples = source_chunks[0].shape[1]  # all chunks assumed equal length
+        # Use HQ waveform if provided, otherwise fall back to the instance waveform.
+        waveform = hq_waveform if hq_waveform is not None else self.waveform
+        sampling_rate = hq_sampling_rate if hq_sampling_rate is not None else self.sampling_rate
+
+        # Build the full padded chunk-time list that matches the feature-index space produced
+        # by make_order (which may include prepended padding chunks before the first beat).
+        effective_chunk_times = self._compute_padded_chunk_times(sampling_rate)
+        num_source_chunks = len(effective_chunk_times)
+
+        # Output grid is based on the median chunk duration across all source chunks.
+        chunk_samples = int(median(
+            round((e - s) * sampling_rate) for s, e in self.chunk_start_end_times_s
+        ))
 
         # Set up dynamic width callback if needed (mirrors apply_order logic)
         source_embeddings = self.get_audio_features()
@@ -359,7 +548,7 @@ class AudioOrderer:
         for position_idx, source_chunk_idx in enumerate(order):
             if dynamic_width_cb is not None:
                 sw, sp = dynamic_width_cb(source_chunk_idx)
-                sw, sp = round(sw), round(sp)
+                sw = round(sw)
             else:
                 sw, sp = smear_width, spread
             per_position_sw_sp.append((sw, sp))
@@ -367,24 +556,20 @@ class AudioOrderer:
         # Log smear/spread statistics
         all_sws = [sw for sw, _ in per_position_sw_sp]
         all_sps = [sp for _, sp in per_position_sw_sp]
-        sw_counts = {}
-        sp_counts = {}
+        sw_counts: dict[int, int] = {}
         for sw in all_sws:
             sw_counts[sw] = sw_counts.get(sw, 0) + 1
-        for sp in all_sps:
-            sp_counts[sp] = sp_counts.get(sp, 0) + 1
         print(f"apply_order_smooth: {num_output_slots} output slots, chunk_samples={chunk_samples}")
         print(f"  smear_width — min={min(all_sws)}, max={max(all_sws)}, mean={sum(all_sws)/len(all_sws):.2f}, "
               f"median={sorted(all_sws)[len(all_sws)//2]}, "
               f"distribution={dict(sorted(sw_counts.items()))}")
-        print(f"  spread      — min={min(all_sps)}, max={max(all_sps)}, mean={sum(all_sps)/len(all_sps):.2f}, "
-              f"median={sorted(all_sps)[len(all_sps)//2]}, "
-              f"distribution={dict(sorted(sp_counts.items()))}")
+        print(f"  spread      — min={min(all_sps):.3f}, max={max(all_sps):.3f}, "
+              f"mean={sum(all_sps)/len(all_sps):.3f}")
 
-        # Compute the minimum and maximum output-slot index that any source chunk will write to.
-        # For position k with smear_width sw, writes land on slots k-sw … k+sw.
-        min_slot = min(position_idx - sw for position_idx, (sw, _) in enumerate(per_position_sw_sp))
-        max_slot = max(position_idx + sw for position_idx, (sw, _) in enumerate(per_position_sw_sp))
+        # Compute the min/max output-slot index that any source chunk will write to.
+        # smear contributes ±sw slots; spread bleeds an extra ±(sp-1)/2 chunk-widths beyond that.
+        min_slot = min(math.floor(i - sw - (sp - 1.0) / 2) for i, (sw, sp) in enumerate(per_position_sw_sp))
+        max_slot = max(math.ceil( i + sw + (sp - 1.0) / 2) for i, (sw, sp) in enumerate(per_position_sw_sp))
 
         pre_pad  = max(0, -min_slot)               # extra slots prepended
         post_pad = max(0, max_slot - (num_output_slots - 1))  # extra slots appended
@@ -394,12 +579,27 @@ class AudioOrderer:
               f"total {total_slots} slots ({total_samples} samples)")
 
         output_buffer = torch.zeros(2, total_samples)
-        # accumulator tracks the sum of envelope amplitudes at each sample position, used for
-        # per-sample normalisation so loudness is flat across smear/spread overlap zones.
+        # accumulator tracks per-sample sum of envelope weights for normalisation
         accumulator = torch.zeros(1, total_samples)
 
         # --- Pass 2: write each source chunk into the buffer ---
-        for position_idx, (source_chunk_idx, (sw, sp)) in enumerate(zip(order, per_position_sw_sp)):
+        for position_idx, (source_chunk_idx, (sw, sp)) in enumerate(tqdm(zip(order, per_position_sw_sp), total=len(per_position_sw_sp))):
+            # Read this source chunk once, with spread baked in and faded
+            src, src_env = self._read_stereo_chunk(
+                waveform, sampling_rate, source_chunk_idx, wrap_mode, stretch,
+                chunk_samples, spread=sp+1,
+                chunk_times=effective_chunk_times)
+
+            if rms_normalize_chunks:
+                # Scale each source chunk to unit RMS before mixing so that loud and quiet
+                # chunks contribute equal energy.  This prevents the perceived level from
+                # drifting based on the intrinsic loudness of the source material being drawn.
+                chunk_rms = src.pow(2).mean().sqrt()
+                if chunk_rms > 1e-8:
+                    src = src / chunk_rms
+            out_width = src.shape[1]  # = round(sp * chunk_samples)
+            extra_each_side = (out_width - chunk_samples) // 2
+
             envelope = _build_envelope(envelope_shape, sw, 'in-out')  # length 2*sw+1
 
             for smear_slot_i, smear_slot in enumerate(range(-sw, sw + 1)):
@@ -407,39 +607,36 @@ class AudioOrderer:
                 if amp == 0:
                     continue
 
-                # raw target slot in sort_order space; offset by pre_pad for buffer indexing
                 target_slot_logical = position_idx + smear_slot
                 if wrap_mode == 'wrap':
                     target_slot_logical = target_slot_logical % num_output_slots
                 elif target_slot_logical < -pre_pad or target_slot_logical >= num_output_slots + post_pad:
-                    continue  # genuinely out of range even with padding
+                    continue
 
                 target_slot_buf = target_slot_logical + pre_pad
-                target_start = target_slot_buf * chunk_samples
-                target_end = target_start + chunk_samples
+                # nominal slot start; spread extends extra_each_side to the left
+                write_start = target_slot_buf * chunk_samples - extra_each_side
+                write_end   = write_start + out_width
 
-                for spread_slot in range(-sp, sp + 1):
-                    actual_source_idx = source_chunk_idx + spread_slot
-                    if wrap_mode == 'wrap':
-                        actual_source_idx = actual_source_idx % num_source_chunks
-                    elif actual_source_idx < 0 or actual_source_idx >= num_source_chunks:
-                        continue
+                # clamp to buffer bounds
+                buf_lo = max(0, write_start)
+                buf_hi = min(total_samples, write_end)
+                s_lo   = buf_lo - write_start
+                s_hi   = s_lo + (buf_hi - buf_lo)
+                if s_hi <= s_lo:
+                    continue
 
-                    src = source_chunks[actual_source_idx]  # [2, chunk_samples]
-                    # guard against rare off-by-one chunk lengths
-                    if src.shape[1] != chunk_samples:
-                        src = torch.nn.functional.pad(src[:, :chunk_samples],
-                                                      (0, max(0, chunk_samples - src.shape[1])))
-
-                    output_buffer[:, target_start:target_end] += src * amp
-                    accumulator[:, target_start:target_end] += amp
+                output_buffer[:, buf_lo:buf_hi] += src[:, s_lo:s_hi] * amp
+                accumulator[:,   buf_lo:buf_hi] += src_env[s_lo:s_hi] * amp
 
         # Per-sample normalisation: divide by the accumulated envelope weight so that every
         # sample position reflects its "fair share" of amplitude regardless of how many
         # smear/spread sources overlap there.
-        output_buffer = output_buffer / accumulator.clamp(min=1e-6)
+        output_buffer = output_buffer / accumulator.clamp(min=1e-2)
+        print("output buffer max/min/mean:", output_buffer.abs().max().item(), output_buffer.abs().min().item(), output_buffer.abs().mean().item())
 
-        # Final peak normalisation
+        # Soft clip via tanh, then peak normalise
+        output_buffer = torch.tanh(output_buffer/10) * 10
         output_buffer = 0.99 * output_buffer / output_buffer.abs().max()
 
         if save:
