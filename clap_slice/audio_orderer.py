@@ -4,7 +4,7 @@ import os
 import pickle
 from dataclasses import dataclass
 from statistics import mean, median
-from typing import Generator, Literal, Optional, Tuple, List
+from typing import Generator, Literal, Optional, Tuple, List, Any
 
 import librosa
 
@@ -551,20 +551,11 @@ class AudioOrderer:
                 sw = round(sw)
             else:
                 sw, sp = smear_width, spread
+            sp = max(sp, 1.1) # avoid 1.0 ie always have a small fade in/out
             per_position_sw_sp.append((sw, sp))
 
         # Log smear/spread statistics
-        all_sws = [sw for sw, _ in per_position_sw_sp]
-        all_sps = [sp for _, sp in per_position_sw_sp]
-        sw_counts: dict[int, int] = {}
-        for sw in all_sws:
-            sw_counts[sw] = sw_counts.get(sw, 0) + 1
-        print(f"apply_order_smooth: {num_output_slots} output slots, chunk_samples={chunk_samples}")
-        print(f"  smear_width — min={min(all_sws)}, max={max(all_sws)}, mean={sum(all_sws)/len(all_sws):.2f}, "
-              f"median={sorted(all_sws)[len(all_sws)//2]}, "
-              f"distribution={dict(sorted(sw_counts.items()))}")
-        print(f"  spread      — min={min(all_sps):.3f}, max={max(all_sps):.3f}, "
-              f"mean={sum(all_sps)/len(all_sps):.3f}")
+        self._log_smear_spread_stats(chunk_samples, num_output_slots, per_position_sw_sp)
 
         # Compute the min/max output-slot index that any source chunk will write to.
         # smear contributes ±sw slots; spread bleeds an extra ±(sp-1)/2 chunk-widths beyond that.
@@ -632,7 +623,7 @@ class AudioOrderer:
         # Per-sample normalisation: divide by the accumulated envelope weight so that every
         # sample position reflects its "fair share" of amplitude regardless of how many
         # smear/spread sources overlap there.
-        output_buffer = output_buffer / accumulator.clamp(min=1e-2)
+        # output_buffer = output_buffer / accumulator.clamp(min=1e-2)
         print("output buffer max/min/mean:", output_buffer.abs().max().item(), output_buffer.abs().min().item(), output_buffer.abs().mean().item())
 
         # Soft clip via tanh, then peak normalise
@@ -655,6 +646,19 @@ class AudioOrderer:
             print('saved to', save_path)
 
         return AudioOrderingResult(output_audio=output_buffer, smear_details=None)
+
+    def _log_smear_spread_stats(self, chunk_samples: int, num_output_slots: int, per_position_sw_sp: list[Any]):
+        all_sws = [sw for sw, _ in per_position_sw_sp]
+        all_sps = [sp for _, sp in per_position_sw_sp]
+        sw_counts: dict[int, int] = {}
+        for sw in all_sws:
+            sw_counts[sw] = sw_counts.get(sw, 0) + 1
+        print(f"apply_order_smooth: {num_output_slots} output slots, chunk_samples={chunk_samples}")
+        print(f"  smear_width — min={min(all_sws)}, max={max(all_sws)}, mean={sum(all_sws) / len(all_sws):.2f}, "
+              f"median={sorted(all_sws)[len(all_sws) // 2]}, "
+              f"distribution={dict(sorted(sw_counts.items()))}")
+        print(f"  spread      — min={min(all_sps):.3f}, max={max(all_sps):.3f}, "
+              f"mean={sum(all_sps) / len(all_sps):.3f}")
 
     def _resample_waveform_if_necessary(self, target_sampling_rate):
         return type(self).__resample_waveform_if_necessary(self.waveform, self.sampling_rate, target_sampling_rate)
