@@ -18,13 +18,17 @@ from clap_slice import SmearModifier
 
 def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocity=False,
                          smear_modifiers_type: Literal['none', 'sing_vs_instrumental'] = 'sing_vs_instrumental',
+                         smear_modifier_phrases: list[str]=None,
+                         default_smear_width: int=2,
+                         default_spread: int=0,
                          beat_detection_type: Literal['madmom-dbn', 'beat-this'] = 'beat-this',
                          beat_detector_rotate: int = 0, features_type: AudioFeaturesType = 'clap', stretch=False,
+                         filter_beats=True,
                          beat_detector_fps=100,
                          hq_audio_path=None,
                          drop_outlier_pct=0.0):
 
-    beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}.beats.npy"
+    beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}{'.filtered' if filter_beats else ''}.beats.npy"
     if os.path.exists(beats_cache_path):
         print(f"loading beats cache from {beats_cache_path}")
         beat_times_and_indices = np.load(beats_cache_path)
@@ -34,6 +38,8 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
                                               fps=beat_detector_fps,
                                               beat_detection_type=beat_detection_type
                                               )
+        if filter_beats:
+            beat_times_and_indices = _filter_beats(beat_times_and_indices)
         beat_times_and_indices = _rotate_beats(beat_times_and_indices, beat_detector_rotate)
         np.save(beats_cache_path, beat_times_and_indices)
 
@@ -49,10 +55,12 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
         return beat_times_and_indices[sorted(all_beat_indices), 0]
 
     if smear_modifiers_type == 'sing_vs_instrumental':
+        if smear_modifier_phrases is not None:
+            smear_modifier_phrases = ["vocal, song, emotional singing", "instrumental"]
         smear_modifiers = [
             SmearModifier(smear_width=1, spread=4,
-                          match_embedding=clap_slice_instance.clap.get_text_features("vocal, song, emotional singing")),
-            SmearModifier(smear_width=2, spread=1, match_embedding=clap_slice_instance.clap.get_text_features("instrumental"))
+                          match_embedding=clap_slice_instance.clap.get_text_features(smear_modifier_phrases[0])),
+            SmearModifier(smear_width=2, spread=1, match_embedding=clap_slice_instance.clap.get_text_features(smear_modifier_phrases[1]))
         ]
     elif smear_modifiers_type == 'none':
         smear_modifiers = None
@@ -86,10 +94,39 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
             save_tag=save_tag,
             use_velocity=use_velocity,
             stretch=stretch,
+            smear_width=default_smear_width,
+            spread=default_spread,
             audio_features_type=features_type,
             smear_modifiers=smear_modifiers,
             drop_outlier_pct=drop_outlier_pct,
         )
+
+def _filter_beats(beat_times_and_indices: np.ndarray) -> np.ndarray:
+    """
+    Filter incoming beats, dropping any outlier where the inter-beat-1 (downbeat) distance has an error of more than 30% in either direction vs the median inter-beat-1 distance
+    """
+    # Compute median inter-beat-1 (downbeat) interval as the reference
+    beat1_mask = beat_times_and_indices[:, 1] == 1
+    beat1_indices = np.where(beat1_mask)[0]
+    beat1_times = beat_times_and_indices[beat1_indices, 0]
+    inter_beat1_intervals = np.diff(beat1_times)
+    median_interval = np.median(inter_beat1_intervals)
+
+    # Find which beat-1 intervals are outliers, and drop the later downbeat of the offending pair
+    keep = np.ones(len(beat_times_and_indices), dtype=bool)
+    for j, interval in enumerate(inter_beat1_intervals):
+        error = abs(np.log(interval / median_interval))
+        if error > 0.30:
+            if interval < median_interval:
+                # too short: duplicate downbeat — drop the later one and all beats in its bar
+                bad_beat1_idx = beat1_indices[j + 1]
+                # drop everything from bad_beat1_idx up to (but not including) the next downbeat
+                next_beat1_idx = beat1_indices[j + 2] if j + 2 < len(beat1_indices) else len(beat_times_and_indices)
+                keep[bad_beat1_idx:next_beat1_idx] = False
+            # if interval is too long a beat is missing; nothing to drop
+
+    print('filtered beat times; had', beat_times_and_indices.shape[0], 'beats, now', keep.sum())
+    return beat_times_and_indices[keep]
 
 
 def _rotate_beats(beat_times_and_indices: np.ndarray, rotation: int):
@@ -127,8 +164,11 @@ if __name__ == "__main__":
     arg_parser.add_argument("--fps", type=int, default=100, help="frames per second to run the beat detector (default=100)")
     arg_parser.add_argument("--rotate", type=int, default=0, help="rotate the beat detector (default=0)")
     arg_parser.add_argument("--smear_modifiers_type", type=str, choices=['none', 'sing_vs_instrumental'], default='sing_vs_instrumental', help="which smear modifiers to use, if any")
+    arg_parser.add_argument("--smear_width", type=int, default=2, help="Smear width to use with --smear_modifiers_type none")
+    arg_parser.add_argument("--spread", type=int, default=0, help="Spread to use with --smear_modifiers_type none")
     arg_parser.add_argument("--beat_detection_type", type=str, choices=['madmom-dbn', 'beat-this'], default='beat-this', help="Beat detector, either 'madmom-dbn' or 'beat-this'")
     arg_parser.add_argument("--features_type", type=str, choices=['clap', 'mert'], default='clap', help="Audio features provider, valid values are 'clap' or 'mert'. default: 'clap'")
+    arg_parser.add_argument("--smear_modifier_phrases", type=str, nargs="+", help="Smear modifiers phrases to overwrite when using smear_modifiers_type 'sing_vs_instrumental (default is --smear_modifier_phrases \"vocal, song, emotional singing\" \"instrumental\")", default=None)
     arg_parser.add_argument("--drop_outlier_pct", type=float, default=0.0, help="Drop outlier percentage 0..1 (default=0.0)")
     arg_parser.add_argument("--hq_audio_path", type=str, default=None, help="(Optional) path to hq audio file")
 
@@ -142,7 +182,11 @@ if __name__ == "__main__":
                          stretch=args.stretch,
                          beat_detector_fps=args.fps,
                          beat_detector_rotate=args.rotate,
-                         smear_modifiers_type=args.smear_modifiers_type, beat_detection_type=args.beat_detection_type,
+                         smear_modifiers_type=args.smear_modifiers_type,
+                         smear_modifier_phrases=args.smear_modifier_phrases,
+                         default_smear_width=args.smear_width,
+                         default_spread=args.spread,
+                         beat_detection_type=args.beat_detection_type,
                          features_type=args.features_type,
                          hq_audio_path=args.hq_audio_path,
                          drop_outlier_pct=args.drop_outlier_pct)
