@@ -176,7 +176,7 @@ def select_analysis_type():
         except ValueError:
             print("Invalid input. Please enter a valid number.")
 
-def analyze_music(mp3_path, analysis_choice, short_output=False):
+def analyze_music(mp3_path, analysis_choice, csv_output=False):
     """
     Analyzes the music file based on the chosen analysis type.
 
@@ -188,10 +188,11 @@ def analyze_music(mp3_path, analysis_choice, short_output=False):
 
     if analysis_choice == 1:
         key, key_type = determine_key(major_correlations, minor_correlations)
-        if short_output:
-            print(format_key_output(key, key_type))
+        key_str = format_key_output(key, key_type)
+        if csv_output:
+            print(f'"{key_str}","{mp3_path}"')
         else:
-            print(f"\nThe key of the file is {format_key_output(key, key_type)}.")
+            print(f"\nThe key of the file is {key_str}.")
     elif analysis_choice == 2:
         print("\nMajor key correlations:\n")
         print_correlations(major_correlations, "Major")
@@ -217,7 +218,7 @@ def main():
     else:
         mp3_path = args.input
         analysis_choice = 2 if args.detailed else 1
-        analyze_music(mp3_path, analysis_choice, short_output=True)
+        analyze_music(mp3_path, analysis_choice, csv_output=True)
 
 if __name__ == "__main__":
     main()

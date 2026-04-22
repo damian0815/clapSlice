@@ -106,7 +106,7 @@ def get_smear_source_list(
         return [_consolidate_smears(smears) for smears in smear_source_list]
 
 
-def _build_envelope(envelope_shape, smear_width: float, smear_mode) -> torch.Tensor:
+def _build_envelope(envelope_shape, smear_width: float, smear_mode: str) -> torch.Tensor:
     steps = 2*smear_width+1 + 2
     if envelope_shape == 'cos_2pi':
         envelope = 0.5*(1-torch.cos(torch.linspace(0, 2*math.pi, steps=steps)))[1:-1]

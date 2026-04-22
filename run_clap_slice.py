@@ -26,7 +26,11 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
                          filter_beats=True,
                          beat_detector_fps=100,
                          hq_audio_path=None,
-                         drop_outlier_pct=0.0):
+                         drop_outlier_pct=0.0,
+                         chunk_sizes_beats: list[int]=None
+                         ):
+    if chunk_sizes_beats is None:
+        chunk_sizes_beats = [2, 4, 8]
 
     beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}{'.filtered' if filter_beats else ''}.beats.npy"
     if os.path.exists(beats_cache_path):
@@ -55,7 +59,7 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
         return beat_times_and_indices[sorted(all_beat_indices), 0]
 
     if smear_modifiers_type == 'sing_vs_instrumental':
-        if smear_modifier_phrases is not None:
+        if smear_modifier_phrases is None:
             smear_modifier_phrases = ["vocal, song, emotional singing", "instrumental"]
         smear_modifiers = [
             SmearModifier(smear_width=1, spread=4,
@@ -67,15 +71,21 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
     else:
         raise ValueError(f"Unknown smear modifiers: {smear_modifiers_type}")
 
-    for chunk_size_beats in [2, 4, 8]:
-        if chunk_size_beats == 2:
-            chunk_start_times = _get_beat_times([1, 3]) # down- and up-beats
-        elif chunk_size_beats == 4:
-            chunk_start_times = _get_beat_times([1]) # downbeats
-        elif chunk_size_beats == 8:
-            chunk_start_times = _get_beat_times([1])[::2] # every second downbeat
+    for chunk_size_beats in chunk_sizes_beats:
+        beats_per_bar = 4
+        if beats_per_bar == 4:
+            if chunk_size_beats == 1:
+                chunk_start_times = _get_beat_times([1, 2, 3, 4]) # down- and up-beats
+            elif chunk_size_beats == 2:
+                chunk_start_times = _get_beat_times([1, 3]) # down- and up-beats
+            elif chunk_size_beats == 4:
+                chunk_start_times = _get_beat_times([1]) # downbeats
+            elif chunk_size_beats == 8:
+                chunk_start_times = _get_beat_times([1])[::2] # every second downbeat
+            else:
+                raise NotImplementedError("Missing which_beats def")
         else:
-            raise NotImplementedError("Missing which_beats def")
+            raise NotImplementedError("Only 4/4 is supported")
 
         median_chunk_start_interval = np.median(np.diff(chunk_start_times))
         if stretch:
@@ -166,6 +176,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--smear_modifiers_type", type=str, choices=['none', 'sing_vs_instrumental'], default='sing_vs_instrumental', help="which smear modifiers to use, if any")
     arg_parser.add_argument("--smear_width", type=int, default=2, help="Smear width to use with --smear_modifiers_type none")
     arg_parser.add_argument("--spread", type=int, default=0, help="Spread to use with --smear_modifiers_type none")
+    arg_parser.add_argument("--chunk_sizes_beats", type=int, nargs='+', help="Chunk sizes, in beats. Specify multiple for multiple outputs. default: --chunk_sizes_beats 2 4 8")
     arg_parser.add_argument("--beat_detection_type", type=str, choices=['madmom-dbn', 'beat-this'], default='beat-this', help="Beat detector, either 'madmom-dbn' or 'beat-this'")
     arg_parser.add_argument("--features_type", type=str, choices=['clap', 'mert'], default='clap', help="Audio features provider, valid values are 'clap' or 'mert'. default: 'clap'")
     arg_parser.add_argument("--smear_modifier_phrases", type=str, nargs="+", help="Smear modifiers phrases to overwrite when using smear_modifiers_type 'sing_vs_instrumental (default is --smear_modifier_phrases \"vocal, song, emotional singing\" \"instrumental\")", default=None)
@@ -189,5 +200,6 @@ if __name__ == "__main__":
                          beat_detection_type=args.beat_detection_type,
                          features_type=args.features_type,
                          hq_audio_path=args.hq_audio_path,
-                         drop_outlier_pct=args.drop_outlier_pct)
+                         drop_outlier_pct=args.drop_outlier_pct,
+                         chunk_sizes_beats=args.chunk_sizes_beats)
 

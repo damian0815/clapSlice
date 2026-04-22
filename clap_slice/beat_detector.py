@@ -1,3 +1,4 @@
+import argparse
 from typing import Generator, Tuple, Literal
 
 from beat_this.inference import File2Beats
@@ -7,7 +8,7 @@ import numpy as np
 
 
 
-def detect_beats(audio: str, fps=100, beat_detection_type: Literal['madmom-dbn', 'beat-this']='beat_this') -> np.ndarray:
+def detect_beats(audio: str, fps=100, beat_detection_type: Literal['madmom-dbn', 'beat-this']='beat-this') -> np.ndarray:
     """
     Returns an array of shape (num_downbeats, 2) where the first column is the time of the downbeat in seconds and the second column is the beat number within the bar (starting from 1).
     """
@@ -67,4 +68,19 @@ def slice_at_downbeats(audio_path, fps=100) -> Generator[Tuple[np.ndarray, int, 
         audio_slice = waveform[int(prev_time*sampling_rate):int(this_time*sampling_rate)]
         yield audio_slice, sampling_rate, prev_time, this_time
 
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_audio_path", type=str, help="path to audio file")
+
+    args = parser.parse_args()
+
+    beat_times_and_labels = detect_beats(args.input_audio_path)
+
+    beat_times = beat_times_and_labels[:, 0]
+    beat_diffs = np.diff(beat_times)
+    median_beat_diff = np.median(beat_diffs)
+    bpm = 60/median_beat_diff
+    print(bpm)
 

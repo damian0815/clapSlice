@@ -130,8 +130,14 @@ class AudioOrderer:
         return all_features
 
 
-    def make_order(self, window_width=0, preserve_start_and_end=False) -> AudioOrdering:
+    def make_order(self, window_width=0, preserve_start_and_end=False, algorithm: Literal['tsp']='tsp') -> AudioOrdering:
         all_features = self.get_audio_features(window_width_chunks=window_width)
+        if algorithm == 'tsp':
+            return self._make_order_tsp(all_features, window_width, preserve_start_and_end)
+        raise NotImplementedError(f"algorithm '{algorithm}' is not implemented")
+
+
+    def _make_order_tsp(self, all_features: torch.Tensor, window_width: int, preserve_start_and_end: bool):
         pin_first_index, pin_last_index = (0, -1) if preserve_start_and_end else (None, None)
 
         if self.drop_outlier_pct:
@@ -395,6 +401,7 @@ class AudioOrderer:
             stretch: bool,
             target_samples: int,
             spread: float = 0.0,
+            crossfade_pct: float = 0.1,
             chunk_times: Optional[List[Tuple[float, float]]] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, int]:
         """
@@ -425,10 +432,9 @@ class AudioOrderer:
         frac = spread - n_full
         n_extra = 1 if frac > 0 else 0
         total_half = n_full + n_extra      # neighbours on each side
-        total_parts = 2 * total_half + 1
+        #total_parts = 2 * total_half + 1
 
-        fade_pct = 0.1
-        fade_samples = (2 * max(1, round(fade_pct * target_samples))) // 2
+        fade_samples = (2 * max(1, round(crossfade_pct * target_samples))) // 2 # even number
         #xfade_n = min(256, max(1, target_samples // 8))
         xfade_n = fade_samples
 
@@ -460,24 +466,36 @@ class AudioOrderer:
                 return torch.cat([body, tail], dim=1)
             return waveform[:, start_sample:end_sample]
 
-        all_offsets = list(range(-total_half, total_half + 1))
+        all_chunk_idx_offsets = list(range(-total_half, total_half + 1))
         parts: list[torch.Tensor] = []
-        target_part_width = target_samples + fade_samples
 
-        for offset in all_offsets:
+        for chunk_idx_offset in all_chunk_idx_offsets:
             # Resolve neighbour index
-            neighbour_idx = chunk_idx + offset
+            neighbour_idx = chunk_idx + chunk_idx_offset
             if wrap_mode == 'wrap':
                 neighbour_idx = neighbour_idx % num_chunks
             else:
                 neighbour_idx = max(0, min(num_chunks - 1, neighbour_idx))
 
             neighbour_start_s, neighbour_end_s = times[neighbour_idx]
+            neighbour_length_s = neighbour_end_s - neighbour_start_s
 
             # Extend outermost edges by fade_samples for roll-in / roll-out
-            roll_in_out_t = 0.5 * fade_pct * (neighbour_end_s - neighbour_start_s)
-            read_start = round((neighbour_start_s - roll_in_out_t) * sampling_rate)
-            read_end   = round((neighbour_end_s   + roll_in_out_t) * sampling_rate)
+            if chunk_idx_offset < 0:
+                roll_in_t = crossfade_pct * neighbour_length_s
+                roll_out_t = 0
+                target_part_width = target_samples + fade_samples
+            elif chunk_idx_offset > 0:
+                roll_in_t = 0
+                roll_out_t = crossfade_pct * neighbour_length_s
+                target_part_width = target_samples + fade_samples
+            else: # chunk_idx_offset == 0
+                roll_in_t = crossfade_pct * neighbour_length_s
+                roll_out_t = crossfade_pct * neighbour_length_s
+                target_part_width = target_samples + 2*fade_samples
+
+            read_start = round((neighbour_start_s - roll_in_t) * sampling_rate)
+            read_end   = round((neighbour_end_s   + roll_out_t) * sampling_rate)
 
             raw = _safe_slice(read_start, read_end)  # [2, raw_n]
 
@@ -504,19 +522,27 @@ class AudioOrderer:
             parts.append(raw)
 
         # --- Overlap-add stitch ---
-        out_width = target_samples * len(parts) + fade_samples
+        out_width = target_samples * len(parts) + 2*fade_samples
         stitched = torch.zeros(2, out_width)
-        target_offset = -total_half * target_samples
+        target_offset = -(total_half * target_samples + fade_samples)
 
         pos = 0
-        for pi, part in enumerate(parts):
+        for part_idx, part in enumerate(parts):
             pw = part.shape[1]
             stitched[:, pos:pos + pw] += part
-            pos += pw
-            if pi != total_parts-1:
-                pos -= xfade_n
+            pos += pw - xfade_n
 
         envelope_1d = torch.ones(out_width)
+        # apply a final fade over the extensions
+        if abs(target_offset) > 0:
+            # equal power fade in
+            t_overall_fade = torch.linspace(0.0, math.pi / 2, -target_offset)
+            overall_fade_out = torch.cos(t_overall_fade) ** 2  # 1 → 0
+            overall_fade_in  = torch.sin(t_overall_fade) ** 2  # 0 → 1
+            central = torch.ones(target_samples)
+            overall_envelope = torch.cat([overall_fade_in, central, overall_fade_out])
+            stitched *= overall_envelope
+            envelope_1d *= overall_envelope
 
         return stitched, envelope_1d, target_offset   # [2, out_width], [out_width]
 
@@ -525,7 +551,7 @@ class AudioOrderer:
                            smear_width: int = 2,
                            spread: float = 0.0,
                            stretch: bool = False,
-                           wrap_mode: Literal['wrap', 'cut', 'bleed'] = 'wrap',
+                           wrap_mode: Literal['wrap', 'cut', 'bleed'] = 'bleed',
                            envelope_shape: Literal['cos_2pi', 'sin_pi', 'log'] = 'log',
                            smear_modifiers: list[SmearModifier] = None,
                            smooth_smear_modifiers: bool = True,
@@ -540,6 +566,10 @@ class AudioOrderer:
         normalised continuously rather than per-chunk, eliminating onset artifacts at chunk boundaries.
 
         Assumes all source chunks have the same sample length.
+
+        :param smear_width: Controls repetition. If 0, each source chunk is used only once. If N, a source chunk is repeated N times on either side of its target position (with cos fade envelope)
+        :param spread: Controls source width. If >0, audio from either side of the source chunk will also be output for each chunk.
+
         """
         order = audio_ordering.sort_order
         if isinstance(order, torch.Tensor):
@@ -584,24 +614,22 @@ class AudioOrderer:
                 average=smooth_smear_modifiers,
             )
 
-        # --- Pass 1: resolve (sw, sp) per position so we can size the output buffer exactly ---
+        # --- Pass 1: resolve (smear_width, spread) per position so we can size the output buffer exactly ---
         per_position_sw_sp = []
         for output_position_idx, source_chunk_idx in enumerate(order):
             if dynamic_width_cb is not None:
-                sw, sp = dynamic_width_cb(source_chunk_idx)
-                sw = round(sw)
-            else:
-                sw, sp = smear_width, spread
-            per_position_sw_sp.append((sw, sp))
+                smear_width, spread = dynamic_width_cb(source_chunk_idx)
+                smear_width = round(smear_width)
+            per_position_sw_sp.append((smear_width, spread))
 
         # Log smear/spread statistics
         self._log_smear_spread_stats(chunk_samples, num_output_slots, per_position_sw_sp)
 
         # Compute the min/max output-slot index that any source chunk will write to.
-        # smear contributes ±sw slots; spread contributes ±sp neighbour slots.
+        # smear contributes ±smear_width slots; spread contributes ±spread neighbour slots.
         # The outer fade (fade_pct * chunk) is < 1 slot, so we add a margin of 1.
-        min_slot = min(math.floor(i - sw - sp) - 1 for i, (sw, sp) in enumerate(per_position_sw_sp))
-        max_slot = max(math.ceil( i + sw + sp) + 1 for i, (sw, sp) in enumerate(per_position_sw_sp))
+        min_slot = min(math.floor(i - smear_width - spread) - 1 for i, (smear_width, spread) in enumerate(per_position_sw_sp))
+        max_slot = max(math.ceil( i + smear_width + spread) + 1 for i, (smear_width, spread) in enumerate(per_position_sw_sp))
 
         pre_pad  = max(0, -min_slot)               # extra slots prepended
         post_pad = max(0, max_slot - (num_output_slots - 1))  # extra slots appended
@@ -615,12 +643,12 @@ class AudioOrderer:
         accumulator = torch.zeros(1, total_samples)
 
         # --- Pass 2: write each source chunk into the buffer ---
-        for output_position_idx, (source_chunk_idx, (sw, sp)) in enumerate(tqdm(
+        for output_position_idx, (source_chunk_idx, (smear_width, spread)) in enumerate(tqdm(
             zip(order, per_position_sw_sp), desc="assembling", total=len(per_position_sw_sp))):
             # Read this source chunk once, with spread baked in and faded
             src, src_env, target_offset = self._read_stereo_chunk(
                 waveform, sampling_rate, source_chunk_idx, wrap_mode, stretch,
-                chunk_samples, spread=sp,
+                chunk_samples, spread=spread,
                 chunk_times=effective_chunk_times)
 
             if rms_normalize_chunks:
@@ -630,11 +658,11 @@ class AudioOrderer:
                 chunk_rms = src.pow(2).mean().sqrt()
                 if chunk_rms > 1e-8:
                     src = src / chunk_rms
-            out_width = src.shape[1]  # = round(sp * chunk_samples)
+            out_width = src.shape[1]  # = round(spread * chunk_samples)
 
-            envelope = _build_envelope(envelope_shape, sw, 'in-out')  # length 2*sw+1
+            envelope = _build_envelope(envelope_shape, smear_width, 'in-out')  # length 2*smear_width+1
 
-            for smear_slot_i, smear_slot in enumerate(range(-sw, sw + 1)):
+            for smear_slot_i, smear_slot in enumerate(range(-smear_width, smear_width + 1)):
                 amp = envelope[smear_slot_i].item()
                 if amp == 0:
                     continue
@@ -673,7 +701,7 @@ class AudioOrderer:
 
         if save:
             suffix = (
-                (f'dyn' if dynamic_width_cb is not None else f'sw{smear_width}-spread{spread}')
+                (f'dyn' if dynamic_width_cb is not None else f'smear_width{smear_width}-spread{spread}')
                 + ("-str" if stretch else "")
                 + (f"-drop{self.drop_outlier_pct}" if self.drop_outlier_pct and self.drop_outlier_pct > 0 else "")
                 + "-smooth"
