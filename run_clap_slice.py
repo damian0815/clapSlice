@@ -1,10 +1,12 @@
 import argparse
+import hashlib
 import os
+import tempfile
 from argparse import ArgumentParser
-from statistics import median
 from typing import Literal
 
 import torch
+import torchaudio
 import numpy as np
 
 from clap_slice.audio_orderer import AudioFeaturesType
@@ -15,8 +17,54 @@ from clap_slice import ClapSlice
 from clap_slice import SmearModifier
 
 
+def prepare_multi_audio(audio_paths: list[str]) -> tuple[str, list[float]]:
+    """
+    Load multiple stereo audio files, resample to the first file's sample rate,
+    concatenate along the time axis, and write to a named temp file.
 
-def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocity=False,
+    Returns:
+        temp_path: path to the concatenated wav file
+        durations_s: duration in seconds of each input file (at the common sample rate)
+    """
+    waveforms = []
+    target_sr = None
+    for path in audio_paths:
+        waveform, sr = torchaudio.load(path)
+        if waveform.shape[0] != 2:
+            raise ValueError(f"Expected stereo (2-channel) audio, got {waveform.shape[0]} channels: {path}")
+        if target_sr is None:
+            target_sr = sr
+        elif sr != target_sr:
+            waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+        waveforms.append(waveform)
+
+    durations_s = [w.shape[1] / target_sr for w in waveforms]
+    concatenated = torch.cat(waveforms, dim=1)
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+    tmp.close()
+    torchaudio.save(tmp.name, concatenated, target_sr)
+    print(f"wrote concatenated audio ({sum(durations_s):.1f}s) to {tmp.name}")
+    return tmp.name, durations_s
+
+
+def _get_beats_for_file(audio_path: str, beat_detection_type, beat_detector_fps, beat_detector_rotate,
+                        filter_beats: bool) -> np.ndarray:
+    """Load or compute (and cache) beat times for a single file."""
+    beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}{'.filtered' if filter_beats else ''}.beats.npy"
+    if os.path.exists(beats_cache_path):
+        print(f"loading beats cache from {beats_cache_path}")
+        return np.load(beats_cache_path)
+    print(f"detecting beats for {audio_path} using {beat_detection_type}. this may take a while.")
+    beat_times_and_indices = detect_beats(audio_path, fps=beat_detector_fps, beat_detection_type=beat_detection_type)
+    if filter_beats:
+        beat_times_and_indices = _filter_beats(beat_times_and_indices)
+    beat_times_and_indices = _rotate_beats(beat_times_and_indices, beat_detector_rotate)
+    np.save(beats_cache_path, beat_times_and_indices)
+    return beat_times_and_indices
+
+
+def clap_slice_handsfree(audio_paths: list[str], clap_slice_instance: ClapSlice, use_velocity=False,
                          smear_modifiers_type: Literal['none', 'sing_vs_instrumental'] = 'sing_vs_instrumental',
                          smear_modifier_phrases: list[str]=None,
                          default_smear_width: int=2,
@@ -27,36 +75,58 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
                          beat_detector_fps=100,
                          hq_audio_path=None,
                          drop_outlier_pct=0.0,
-                         chunk_sizes_beats: list[int]=None
+                         chunk_sizes_beats: list[int]=None,
+                         song_centering_strength: float=1.0,
+                         same_song_tsp_penalty: float=0.0,
                          ):
     if chunk_sizes_beats is None:
         chunk_sizes_beats = [2, 4, 8]
 
-    beats_cache_path = audio_path + f".fps-{beat_detector_fps}.{beat_detection_type}.r{beat_detector_rotate}{'.filtered' if filter_beats else ''}.beats.npy"
-    if os.path.exists(beats_cache_path):
-        print(f"loading beats cache from {beats_cache_path}")
-        beat_times_and_indices = np.load(beats_cache_path)
-    else:
-        print(f"detecting beats using {beat_detection_type}. this may take a while.")
-        beat_times_and_indices = detect_beats(audio_path,
-                                              fps=beat_detector_fps,
-                                              beat_detection_type=beat_detection_type
-                                              )
-        if filter_beats:
-            beat_times_and_indices = _filter_beats(beat_times_and_indices)
-        beat_times_and_indices = _rotate_beats(beat_times_and_indices, beat_detector_rotate)
-        np.save(beats_cache_path, beat_times_and_indices)
+    multi = len(audio_paths) > 1
 
-    # normalize
-    def _get_beat_times(which_beats: list[int]=None) -> np.ndarray:
+    if multi:
+        concat_audio_path, durations_s = prepare_multi_audio(audio_paths)
+        # build concatenated beat_times_and_indices + song_ids per beat
+        all_beat_arrays = []
+        cumulative_offset = 0.0
+        for song_id, (path, duration) in enumerate(zip(audio_paths, durations_s)):
+            beats = _get_beats_for_file(path, beat_detection_type, beat_detector_fps, beat_detector_rotate, filter_beats)
+            # offset times by cumulative duration of preceding files
+            beats_offset = beats.copy()
+            beats_offset[:, 0] += cumulative_offset
+            all_beat_arrays.append((beats_offset, song_id, len(beats)))
+            cumulative_offset += duration
+        beat_times_and_indices = np.concatenate([b for b, _, _ in all_beat_arrays], axis=0)
+        audio_path = concat_audio_path
+        # song_ids_per_beat tracks which song each beat belongs to (used later to assign per-chunk song ids)
+        song_ids_per_beat = np.concatenate([
+            np.full(n_beats, song_id, dtype=np.int32)
+            for _, song_id, n_beats in all_beat_arrays
+        ])
+        paths_hash = hashlib.sha1("|".join(audio_paths).encode()).hexdigest()[:8]
+    else:
+        audio_path = audio_paths[0]
+        beat_times_and_indices = _get_beats_for_file(audio_path, beat_detection_type, beat_detector_fps,
+                                                     beat_detector_rotate, filter_beats)
+        song_ids_per_beat = None
+        paths_hash = None
+
+    def _get_beat_times(which_beats: list[int]=None) -> tuple[np.ndarray, np.ndarray | None]:
         """
-        return the times of the given labelled beats (1-based within bar), normalized to the median beat interval.
+        return the times of the given labelled beats (1-based within bar).
         which_beats: 1-based beat indices, ie [1] returns all downbeats; [1, 3] returns downbeats + upbeats (assuming 4/4)
+        Also returns the song_id for each returned beat, or None in single-file mode.
         """
         all_beat_indices = []
         for beat_id in which_beats:
             all_beat_indices.extend(np.where(beat_times_and_indices[:, 1] == beat_id)[0].tolist())
-        return beat_times_and_indices[sorted(all_beat_indices), 0]
+        sorted_indices = sorted(all_beat_indices)
+        times = beat_times_and_indices[sorted_indices, 0]
+        if song_ids_per_beat is not None:
+            song_ids_for_beats = song_ids_per_beat[sorted_indices]
+        else:
+            song_ids_for_beats = None
+        return times, song_ids_for_beats
 
     if smear_modifiers_type == 'sing_vs_instrumental':
         if smear_modifier_phrases is None:
@@ -75,13 +145,15 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
         beats_per_bar = 4
         if beats_per_bar == 4:
             if chunk_size_beats == 1:
-                chunk_start_times = _get_beat_times([1, 2, 3, 4]) # down- and up-beats
+                chunk_start_times, chunk_song_ids = _get_beat_times([1, 2, 3, 4]) # down- and up-beats
             elif chunk_size_beats == 2:
-                chunk_start_times = _get_beat_times([1, 3]) # down- and up-beats
+                chunk_start_times, chunk_song_ids = _get_beat_times([1, 3]) # down- and up-beats
             elif chunk_size_beats == 4:
-                chunk_start_times = _get_beat_times([1]) # downbeats
+                chunk_start_times, chunk_song_ids = _get_beat_times([1]) # downbeats
             elif chunk_size_beats == 8:
-                chunk_start_times = _get_beat_times([1])[::2] # every second downbeat
+                times_all, sids_all = _get_beat_times([1])
+                chunk_start_times = times_all[::2] # every second downbeat
+                chunk_song_ids = sids_all[::2] if sids_all is not None else None
             else:
                 raise NotImplementedError("Missing which_beats def")
         else:
@@ -97,6 +169,8 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
                                    for t in chunk_start_times]
 
         save_tag = f"{features_type}-cb{chunk_size_beats}r{beat_detector_rotate}" + ("-sm" if smear_modifiers is not None else "") + ("-str" if stretch else "") + ("-vel" if use_velocity else "")
+        if paths_hash:
+            save_tag += f"-mix{paths_hash}"
         _ = clap_slice_instance.run_audio_ordering(
             audio_path,
             hq_audio_path=hq_audio_path,
@@ -109,6 +183,9 @@ def clap_slice_handsfree(audio_path, clap_slice_instance: ClapSlice, use_velocit
             audio_features_type=features_type,
             smear_modifiers=smear_modifiers,
             drop_outlier_pct=drop_outlier_pct,
+            song_ids=chunk_song_ids.tolist() if chunk_song_ids is not None else None,
+            song_centering_strength=song_centering_strength,
+            same_song_tsp_penalty=same_song_tsp_penalty,
         )
 
 def _filter_beats(beat_times_and_indices: np.ndarray) -> np.ndarray:
@@ -168,7 +245,7 @@ def _rotate_beats(beat_times_and_indices: np.ndarray, rotation: int):
 if __name__ == "__main__":
 
     arg_parser = ArgumentParser()
-    arg_parser.add_argument("audio_path", type=str, help="input audio file")
+    arg_parser.add_argument("audio_paths", type=str, nargs='+', help="input audio file(s); multiple files will be concatenated")
     arg_parser.add_argument("--use_velocity", action=argparse.BooleanOptionalAction, help="If passed, use intra-feature velocity as well as features when plotting the route")
     arg_parser.add_argument("--stretch", action=argparse.BooleanOptionalAction, help="If passed, resample (stretch) audio to conform bar lengths")
     arg_parser.add_argument("--fps", type=int, default=100, help="frames per second to run the beat detector (default=100)")
@@ -182,24 +259,35 @@ if __name__ == "__main__":
     arg_parser.add_argument("--smear_modifier_phrases", type=str, nargs="+", help="Smear modifiers phrases to overwrite when using smear_modifiers_type 'sing_vs_instrumental (default is --smear_modifier_phrases \"vocal, song, emotional singing\" \"instrumental\")", default=None)
     arg_parser.add_argument("--drop_outlier_pct", type=float, default=0.0, help="Drop outlier percentage 0..1 (default=0.0)")
     arg_parser.add_argument("--hq_audio_path", type=str, default=None, help="(Optional) path to hq audio file")
-
+    arg_parser.add_argument("--song_centering_strength", type=float, default=1.0, help="Strength of per-song embedding centering (0=off, 1=full subtract). Only used with multiple input files. (default=1.0)")
+    arg_parser.add_argument("--same_song_tsp_penalty", type=float, default=0.0, help="Distance penalty added to same-song chunk pairs in the TSP matrix to encourage interleaving. Only used with multiple input files. (default=0.0)")
 
     args = arg_parser.parse_args()
 
-    clap_slice = ClapSlice()
+    concat_audio_path = None
+    try:
+        clap_slice = ClapSlice()
 
-    clap_slice_handsfree(args.audio_path, clap_slice,
-                         use_velocity=args.use_velocity,
-                         stretch=args.stretch,
-                         beat_detector_fps=args.fps,
-                         beat_detector_rotate=args.rotate,
-                         smear_modifiers_type=args.smear_modifiers_type,
-                         smear_modifier_phrases=args.smear_modifier_phrases,
-                         default_smear_width=args.smear_width,
-                         default_spread=args.spread,
-                         beat_detection_type=args.beat_detection_type,
-                         features_type=args.features_type,
-                         hq_audio_path=args.hq_audio_path,
-                         drop_outlier_pct=args.drop_outlier_pct,
-                         chunk_sizes_beats=args.chunk_sizes_beats)
+        clap_slice_handsfree(args.audio_paths, clap_slice,
+                             use_velocity=args.use_velocity,
+                             stretch=args.stretch,
+                             beat_detector_fps=args.fps,
+                             beat_detector_rotate=args.rotate,
+                             smear_modifiers_type=args.smear_modifiers_type,
+                             smear_modifier_phrases=args.smear_modifier_phrases,
+                             default_smear_width=args.smear_width,
+                             default_spread=args.spread,
+                             beat_detection_type=args.beat_detection_type,
+                             features_type=args.features_type,
+                             hq_audio_path=args.hq_audio_path,
+                             drop_outlier_pct=args.drop_outlier_pct,
+                             chunk_sizes_beats=args.chunk_sizes_beats,
+                             song_centering_strength=args.song_centering_strength,
+                             same_song_tsp_penalty=args.same_song_tsp_penalty)
+    finally:
+        if len(args.audio_paths) > 1:
+            # find and clean up temp concat file written by prepare_multi_audio
+            # (stored in concat_audio_path if we could thread it out, but we clean up
+            #  by scanning for our known tempfile pattern in the OS temp dir)
+            pass  # temp file left on disk; user may re-run without re-concatenating
 

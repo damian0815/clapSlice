@@ -130,40 +130,72 @@ class AudioOrderer:
         return all_features
 
 
-    def make_order(self, window_width=0, preserve_start_and_end=False, algorithm: Literal['tsp']='tsp') -> AudioOrdering:
+    def make_order(self, window_width=0, preserve_start_and_end=False, algorithm: Literal['tsp']='tsp',
+                   song_ids: list[int]=None, song_centering_strength: float=1.0,
+                   same_song_tsp_penalty: float=0.0) -> AudioOrdering:
         all_features = self.get_audio_features(window_width_chunks=window_width)
         if algorithm == 'tsp':
-            return self._make_order_tsp(all_features, window_width, preserve_start_and_end)
+            return self._make_order_tsp(all_features, window_width, preserve_start_and_end,
+                                        song_ids=song_ids,
+                                        song_centering_strength=song_centering_strength,
+                                        same_song_tsp_penalty=same_song_tsp_penalty)
         raise NotImplementedError(f"algorithm '{algorithm}' is not implemented")
 
 
-    def _make_order_tsp(self, all_features: torch.Tensor, window_width: int, preserve_start_and_end: bool):
+    def _make_order_tsp(self, all_features: torch.Tensor, window_width: int, preserve_start_and_end: bool,
+                        song_ids: list[int]=None, song_centering_strength: float=1.0,
+                        same_song_tsp_penalty: float=0.0):
         pin_first_index, pin_last_index = (0, -1) if preserve_start_and_end else (None, None)
 
+        # Per-song embedding centering: subtract each song's mean embedding (scaled by strength)
+        if song_ids is not None and song_centering_strength > 0.0:
+            features = all_features.clone()
+            for sid in set(song_ids):
+                mask = [i for i, s in enumerate(song_ids) if s == sid]
+                song_mean = features[mask].mean(dim=0, keepdim=True)
+                features[mask] -= song_centering_strength * song_mean
+            print(f"applied per-song embedding centering (strength={song_centering_strength}) across {len(set(song_ids))} songs")
+        else:
+            features = all_features
+
         if self.drop_outlier_pct:
-            n = all_features.shape[0]
+            n = features.shape[0]
             n_drop = max(1, round(n * self.drop_outlier_pct))
             # Use k-means to find cluster centroids, then drop points farthest from their nearest centroid
             from sklearn.cluster import KMeans
             n_clusters = max(1, min(8, n // 4))
-            features_np = all_features.detach().cpu().float().numpy()
+            features_np = features.detach().cpu().float().numpy()
             kmeans = KMeans(n_clusters=n_clusters, n_init='auto', random_state=0).fit(features_np)
-            centroids = torch.tensor(kmeans.cluster_centers_, dtype=all_features.dtype)
+            centroids = torch.tensor(kmeans.cluster_centers_, dtype=features.dtype)
             # distance of each point to its nearest centroid
-            dists = torch.cdist(all_features.cpu().float(), centroids)  # [n, n_clusters]
+            dists = torch.cdist(features.cpu().float(), centroids)  # [n, n_clusters]
             min_dists = dists.min(dim=1).values  # [n]
             # indices sorted by distance descending — most outlying first
             sorted_by_dist = torch.argsort(min_dists, descending=True)
             outlier_indices = set(sorted_by_dist[:n_drop].tolist())
             kept_indices = [i for i in range(n) if i not in outlier_indices]
-            filtered_features = all_features[kept_indices]
+            filtered_features = features[kept_indices]
+            filtered_song_ids = [song_ids[i] for i in kept_indices] if song_ids is not None else None
             section_remap = {new_i: orig_i for new_i, orig_i in enumerate(kept_indices)}
             print(f"drop_outlier_pct={self.drop_outlier_pct}: dropped {n_drop}/{n} outliers, keeping {len(kept_indices)}")
         else:
-            filtered_features = all_features
+            filtered_features = features
+            filtered_song_ids = song_ids
             section_remap = {i: i for i in range(len(filtered_features))}
 
-        sort_order_raw = sort_tsp(filtered_features, pin_first_index=pin_first_index, pin_last_index=pin_last_index).tolist()
+        # Build same-song TSP distance penalty matrix
+        dist_matrix_offset = None
+        if filtered_song_ids is not None and same_song_tsp_penalty > 0.0:
+            n = len(filtered_features)
+            dist_matrix_offset = torch.zeros(n, n, dtype=filtered_features.dtype)
+            for i in range(n):
+                for j in range(n):
+                    if i != j and filtered_song_ids[i] == filtered_song_ids[j]:
+                        dist_matrix_offset[i, j] = same_song_tsp_penalty
+            print(f"applied same-song TSP penalty={same_song_tsp_penalty}")
+
+        sort_order_raw = sort_tsp(filtered_features, pin_first_index=pin_first_index, pin_last_index=pin_last_index,
+                                  dist_matrix_offset=dist_matrix_offset).tolist()
         sort_order_remapped = torch.tensor([section_remap[i]
                                for i in sort_order_raw])
         return AudioOrdering(

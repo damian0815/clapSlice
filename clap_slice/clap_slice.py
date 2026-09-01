@@ -31,6 +31,9 @@ class ClapSlice:
         hq_audio_path: str=None,
         drop_outlier_pct: float=0.0,
         window_width: float=0,
+        song_ids: list[int]=None,
+        song_centering_strength: float=1.0,
+        same_song_tsp_penalty: float=0.0,
 
     ) -> tuple[AudioOrdering, AudioOrderingResult]:
         audio_orderer = AudioOrderer(
@@ -46,6 +49,9 @@ class ClapSlice:
         sort_order = audio_orderer.make_order(
             preserve_start_and_end=True,
             window_width=window_width,
+            song_ids=song_ids,
+            song_centering_strength=song_centering_strength,
+            same_song_tsp_penalty=same_song_tsp_penalty,
         )
         audio_ordering_result = audio_orderer.apply_order_smooth(
             audio_ordering=sort_order,
